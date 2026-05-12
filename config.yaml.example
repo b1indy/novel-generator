@@ -1,0 +1,22 @@
+# 网络小说生成器配置模板
+# 复制此文件为 config.yaml 并填入实际值
+
+# DeepSeek API 配置
+llm:
+  api_key: "your-deepseek-api-key"
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-chat"  # 或 deepseek-reasoner
+  max_tokens: 8192
+  temperature: 0.8
+
+# 生成参数默认值
+generation:
+  words_per_chapter: 3000      # 每章默认字数
+  chapters_per_volume: 15      # 每卷默认章数
+  target_total_words: 2000000  # 目标总字数
+
+# 审计参数
+audit:
+  enabled: true
+  auto_fix: false              # 是否自动修复（true=自动，false=输出报告人工确认）
+  logic_severity_threshold: "minor"  # 报告的最低严重级别: critical, major, minor
