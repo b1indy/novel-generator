@@ -1180,44 +1180,222 @@ def _write_volume(
 
 def build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argument parser with all subcommands."""
-    parser = argparse.ArgumentParser(
-        prog="python cli.py",
-        description="网络小说生成器 - CLI交互式工具",
+
+    # Shared examples and notes.
+    _common_network_note = (
+        "💡 网络故障恢复提示\n"
+        "  如果因网络问题导致 LLM 调用失败，直接重新运行相同命令即可。\n"
+        "  已生成的内容（大纲、章节）会保存在 data/ 目录下，不会丢失。\n"
+        "  可用 'python cli.py status --novel <名称>' 查看当前进度。"
     )
 
-    sub = parser.add_subparsers(dest="command", help="可用命令")
+    parser = argparse.ArgumentParser(
+        prog="python cli.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "网络小说生成器 —— 按卷生成超长篇小说，支持记忆追踪与质量审计。\n\n"
+            "典型工作流程:\n"
+            "  1. python cli.py new                 创建新小说，生成总大纲及第一卷大纲\n"
+            "  2. python cli.py write --novel X --volume 1   生成第一卷正文\n"
+            "  3. python cli.py audit --novel X --volume 1   审计第一卷质量\n"
+            "  4. python cli.py continue --novel X           继续生成下一卷\n\n"
+            "如果中途因网络问题中断，直接用相同命令重试即可，已生成内容不会丢失。\n"
+            "随时用 'python cli.py status --novel <名称>' 查看进度。"
+        ),
+        epilog=(
+            "更多信息: https://github.com/b1indy/novel-generator\n"
+            "配置文件: config.yaml（首次使用请复制 config.yaml.example 并填入 API key)"
+        ),
+    )
+
+    sub = parser.add_subparsers(
+        dest="command",
+        title="可用命令",
+        description="使用 'python cli.py <命令> --help' 查看各命令的详细用法。",
+    )
 
     # --- new ---
-    sub.add_parser("new", help="创建新小说（交互式向导）")
+    new_parser = sub.add_parser(
+        "new",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="创建新小说（交互式引导）",
+        description=(
+            "交互式创建一部新小说，引导你完成:\n"
+            "  1. 设定小说名称与标题\n"
+            "  2. 选择流派（玄幻/都市/科幻/仙侠/历史/悬疑）\n"
+            "  3. 选择作家风格（辰东式/猫腻式/番茄式/老鹰式/唐家三少式）\n"
+            "  4. 可选自定义风格参数并保存\n"
+            "  5. 设定目标总字数\n"
+            "  6. 生成总大纲（含世界观、主线、分卷规划、100字导语）\n"
+            "  7. 生成第一卷大纲（含章节计划、导语）\n"
+            "  8. 可选直接开始生成第一卷正文"
+        ),
+        epilog=(
+            "示例:\n"
+            "  python cli.py new\n\n"
+            "网络故障恢复:\n"
+            "  如果大纲生成步骤失败（如网络超时），小说目录已创建，此时可:\n"
+            "  - python cli.py outline --novel <名称>              查看大纲状态\n"
+            "  - python cli.py outline --novel <名称> --volume 1   重新生成第一卷大纲\n"
+            "  - python cli.py status --novel <名称>               查看完整进度"
+        ),
+    )
 
     # --- outline ---
-    outline_parser = sub.add_parser("outline", help="管理小说大纲")
-    outline_parser.add_argument("--novel", type=str, help="小说名称")
-    outline_parser.add_argument("--volume", type=int, help="生成指定卷的大纲")
-    outline_parser.add_argument("--update", action="store_true", help="修改总大纲")
+    outline_parser = sub.add_parser(
+        "outline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="查看或生成小说大纲",
+        description=(
+            "管理小说大纲（总大纲和卷大纲）。根据参数不同有三种模式:\n\n"
+            "【查看模式】仅指定小说名称，展示总大纲和所有卷大纲概览。\n\n"
+            "【生成卷大纲】指定 --volume，为某一卷生成大纲。生成时会自动注入\n"
+            "前续卷的剧情小结和末两章，保证跨卷逻辑连贯。\n\n"
+            "【修改总大纲】指定 --update，交互式修改总大纲。写作过程中如果\n"
+            "剧情走向与原大纲偏离，可以用此命令灵活调整。"
+        ),
+        epilog=(
+            "示例:\n"
+            "  python cli.py outline --novel my-novel              查看所有大纲\n"
+            "  python cli.py outline --novel my-novel --volume 3   生成第3卷大纲\n"
+            "  python cli.py outline --novel my-novel --update     修改总大纲\n\n"
+            f"{_common_network_note}"
+        ),
+    )
+    outline_parser.add_argument(
+        "--novel", type=str,
+        help="小说名称（即 new 时输入的英文/拼音标识）",
+    )
+    outline_parser.add_argument(
+        "--volume", type=int, metavar="N",
+        help="为第 N 卷生成大纲（如 --volume 3）",
+    )
+    outline_parser.add_argument(
+        "--update", action="store_true",
+        help="交互式修改总大纲",
+    )
 
     # --- write ---
-    write_parser = sub.add_parser("write", help="生成指定卷的小说")
-    write_parser.add_argument("--novel", type=str, required=True, help="小说名称")
-    write_parser.add_argument("--volume", type=int, required=True, help="卷号")
-    write_parser.add_argument("--words", type=int, default=None, help="每章目标字数（覆盖config.yaml设置）")
+    write_parser = sub.add_parser(
+        "write",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="生成指定卷的小说正文",
+        description=(
+            "按卷大纲逐章生成小说正文。每章包含标题，生成后自动更新\n"
+            "角色表、物品表、伏笔表。整卷完成后自动生成本卷小结。\n\n"
+            "需要先有卷大纲。如果目标卷的大纲不存在，会自动先生成大纲。"
+        ),
+        epilog=(
+            "示例:\n"
+            "  python cli.py write --novel my-novel --volume 1               默认每章5000字\n"
+            "  python cli.py write --novel my-novel --volume 2 --words 6000  每章6000字\n\n"
+            f"{_common_network_note}"
+        ),
+    )
+    write_parser.add_argument(
+        "--novel", type=str, required=True,
+        help="小说名称（必填）",
+    )
+    write_parser.add_argument(
+        "--volume", type=int, required=True, metavar="N",
+        help="要生成的卷号，从 1 开始（必填）",
+    )
+    write_parser.add_argument(
+        "--words", type=int, default=None, metavar="N",
+        help="每章目标字数，覆盖 config.yaml 中的 words_per_chapter 设置",
+    )
 
     # --- audit ---
-    audit_parser = sub.add_parser("audit", help="审计指定卷")
-    audit_parser.add_argument("--novel", type=str, required=True, help="小说名称")
-    audit_parser.add_argument("--volume", type=int, required=True, help="卷号")
-    audit_parser.add_argument("--fix", action="store_true", help="自动修复发现的问题")
+    audit_parser = sub.add_parser(
+        "audit",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="审计小说质量（逻辑+AI味）",
+        description=(
+            "对指定卷进行双维度质量审计，单次 LLM 调用同时检查:\n"
+            "  1. 逻辑一致性 — 角色行为、时间线、物品归属、伏笔衔接、世界观\n"
+            "  2. AI写作痕迹 — 重复句式、模板化描写、生硬对话、情感平淡\n\n"
+            "审计结果按严重程度（critical/major/minor）分类展示。\n"
+            "使用 --fix 可自动修复发现的问题。"
+        ),
+        epilog=(
+            "示例:\n"
+            "  python cli.py audit --novel my-novel --volume 1         仅审计，输出报告\n"
+            "  python cli.py audit --novel my-novel --volume 1 --fix   审计并自动修复\n\n"
+            "💡 建议每写完一卷就审计一次，及时修复问题比事后补救更省力。"
+        ),
+    )
+    audit_parser.add_argument(
+        "--novel", type=str, required=True,
+        help="小说名称（必填）",
+    )
+    audit_parser.add_argument(
+        "--volume", type=int, required=True, metavar="N",
+        help="要审计的卷号（必填）",
+    )
+    audit_parser.add_argument(
+        "--fix", action="store_true",
+        help="审计后自动修复发现的问题",
+    )
 
     # --- status ---
-    status_parser = sub.add_parser("status", help="查看小说进度")
-    status_parser.add_argument("--novel", type=str, help="小说名称")
+    status_parser = sub.add_parser(
+        "status",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="查看小说进度与状态",
+        description=(
+            "显示小说的完整状态，包括:\n"
+            "  - 基本信息（标题、流派、风格、目标字数）\n"
+            "  - 创作进度（已写卷数/计划卷数、总字数）\n"
+            "  - 角色统计（总数、活跃数）\n"
+            "  - 伏笔统计（待回收数量）\n"
+            "  - 各卷详情（状态、标题、章数、导语）\n"
+            "  - 下一卷号\n\n"
+            "如果不指定 --novel，会列出可用小说名称。"
+        ),
+        epilog=(
+            "示例:\n"
+            "  python cli.py status --novel my-novel   查看指定小说进度\n"
+            "  python cli.py status                    列出所有小说后选择"
+        ),
+    )
+    status_parser.add_argument(
+        "--novel", type=str,
+        help="小说名称（不指定则列出所有小说）",
+    )
 
     # --- continue ---
-    continue_parser = sub.add_parser("continue", help="继续生成下一卷")
-    continue_parser.add_argument("--novel", type=str, required=True, help="小说名称")
+    continue_parser = sub.add_parser(
+        "continue",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="自动继续生成下一卷",
+        description=(
+            "一键式继续创作：自动检测下一未写卷 → 生成卷大纲（如未生成）\n"
+            "→ 逐章写作 → 可选审计。适合日常连载式操作，无需手动指定卷号。\n\n"
+            "如果所有计划卷已写完，会提示完成。\n"
+            "如果想在计划外追加卷，请使用 outline --volume N 生成新卷大纲。"
+        ),
+        epilog=(
+            "示例:\n"
+            "  python cli.py continue --novel my-novel\n\n"
+            f"{_common_network_note}"
+        ),
+    )
+    continue_parser.add_argument(
+        "--novel", type=str, required=True,
+        help="小说名称（必填）",
+    )
 
     # --- list ---
-    sub.add_parser("list", help="列出所有小说")
+    list_parser = sub.add_parser(
+        "list",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="列出所有小说",
+        description=(
+            "列出 data/ 目录下所有已创建的小说，显示:\n"
+            "  名称、标题、流派、风格、已写卷数、总字数"
+        ),
+        epilog="示例:\n  python cli.py list",
+    )
 
     return parser
 
