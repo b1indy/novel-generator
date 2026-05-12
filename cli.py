@@ -16,8 +16,70 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import locale
 import logging
+import os
 import sys
+
+# ---------------------------------------------------------------------------
+# Multi-byte character input fix
+#   Chinese characters in UTF-8 are 3 bytes.  Without proper locale /
+#   readline configuration the terminal may treat each byte as a separate
+#   character, requiring multiple backspace presses to delete one glyph.
+# ---------------------------------------------------------------------------
+
+
+def _setup_encoding() -> None:
+    """Configure locale and readline so multi-byte UTF-8 input works properly.
+
+    Without this, Chinese characters (3 bytes each in UTF-8) are treated
+    as multiple characters by readline, requiring multiple backspace
+    presses to delete a single glyph.
+    """
+    # 1. Ensure environment-level encoding — prefer a CJK-aware locale so
+    #    readline correctly computes character display widths.
+    for var in ("LANG", "LC_CTYPE", "LC_ALL"):
+        val = os.environ.get(var, "")
+        if val and "utf" not in val.lower():
+            os.environ[var] = "zh_CN.UTF-8"
+
+    if not any("UTF-8" in os.environ.get(v, "") for v in ("LANG", "LC_ALL", "LC_CTYPE")):
+        os.environ["LANG"] = "zh_CN.UTF-8"
+
+    # 2. Set Python locale from environment.
+    #    Try CJK-aware locale first (better character-width tables for
+    #    Chinese), fall back to generic UTF-8.
+    ctype_set = False
+    for loc in ("zh_CN.UTF-8", "en_US.UTF-8", "C.UTF-8"):
+        try:
+            locale.setlocale(locale.LC_CTYPE, loc)
+            ctype_set = True
+            break
+        except locale.Error:
+            continue
+
+    if not ctype_set:
+        try:
+            locale.setlocale(locale.LC_CTYPE, "")
+        except locale.Error:
+            pass
+
+    # 3. Ensure stdin/stdout use UTF-8 (belt-and-suspenders with
+    #    PYTHONIOENCODING for subprocess / pipe scenarios).
+    if sys.stdin.encoding and "utf" not in sys.stdin.encoding.lower():
+        import io
+        sys.stdin = io.TextIOWrapper(
+            sys.stdin.buffer, encoding="utf-8", errors="replace"
+        )
+    if sys.stdout.encoding and "utf" not in sys.stdout.encoding.lower():
+        import io
+        sys.stdout = io.TextIOWrapper(
+            sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+        )
+
+
+_setup_encoding()
+del _setup_encoding
 from pathlib import Path
 from typing import Any
 
