@@ -285,6 +285,7 @@ class OutlineGenerator:
         prev_summaries: list[dict[str, Any]],
         last_chapters: list[dict[str, Any]],
         memory_context: dict[str, Any],
+        chapters_per_volume: int = 50,
     ) -> dict[str, Any]:
         """Generate a detailed outline for a specific volume.
 
@@ -300,6 +301,8 @@ class OutlineGenerator:
                 as a dict with ``title`` and ``content`` keys.
             memory_context: Dict containing current memory tables
                 (``characters``, ``items``, ``foreshadowing``).
+            chapters_per_volume: Number of chapters to plan for this volume.
+                Defaults to 50.
 
         Returns:
             A structured dict with keys: ``volume_title``, ``volume_arc``,
@@ -308,13 +311,11 @@ class OutlineGenerator:
         Raises:
             ValueError: If the LLM response cannot be parsed as valid JSON.
         """
-        # Extract target chapter count from total outline volume plan.
+        # Look up volume title hint from total outline volume plan.
         volume_plan = total_outline.get("volume_plan", [])
-        target_chapters = 15
         volume_title_hint = ""
         for vp in volume_plan:
             if vp.get("volume") == volume_num:
-                target_chapters = vp.get("estimated_chapters", 15)
                 volume_title_hint = vp.get("title", "")
                 break
 
@@ -373,10 +374,10 @@ class OutlineGenerator:
 
         user_prompt = (
             f"请为第{volume_num}卷设计详细的卷大纲。\n\n"
-            f"本卷规划约{target_chapters}章。\n\n"
+            f"生成本卷大纲，规划恰好{chapters_per_volume}章。\n\n"
             f"参考上下文：\n{context_text}\n\n"
             f"请按照要求的JSON格式输出卷大纲。注意：\n"
-            f"- 章节规划需包含{target_chapters}章的具体内容\n"
+            f"- 章节规划需恰好包含{chapters_per_volume}章的具体内容\n"
             f"- 确保与前续剧情衔接自然\n"
             f"- 推进总大纲中的主线剧情\n"
             f"- 合理安排伏笔的铺设与回收\n"
@@ -393,9 +394,9 @@ class OutlineGenerator:
         ]
 
         logger.info(
-            "Generating volume %d outline (target chapters=%d)",
+            "Generating volume %d outline (chapters_per_volume=%d)",
             volume_num,
-            target_chapters,
+            chapters_per_volume,
         )
 
         response = self._llm.chat(

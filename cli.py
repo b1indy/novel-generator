@@ -21,6 +21,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 # ---------------------------------------------------------------------------
 # Rich imports (required dependency)
 # ---------------------------------------------------------------------------
@@ -79,6 +81,33 @@ def load_config_path() -> Path:
     return Path("config.yaml.example")
 
 
+def load_generation_config(config_path: Path) -> dict[str, int]:
+    """Extract generation parameters from the YAML config.
+
+    Returns a ``dict`` with keys ``chapters_per_volume`` and
+    ``words_per_chapter``, defaulting to 50 and 5000 respectively when
+    the section or keys are missing.
+    """
+    defaults = {"chapters_per_volume": 50, "words_per_chapter": 5000}
+    try:
+        raw = yaml.safe_load(config_path.read_text())
+    except (yaml.YAMLError, OSError):
+        return defaults
+    if not isinstance(raw, dict):
+        return defaults
+    generation = raw.get("generation")
+    if not isinstance(generation, dict):
+        return defaults
+    return {
+        "chapters_per_volume": int(
+            generation.get("chapters_per_volume", defaults["chapters_per_volume"])
+        ),
+        "words_per_chapter": int(
+            generation.get("words_per_chapter", defaults["words_per_chapter"])
+        ),
+    }
+
+
 # ===================================================================
 # Initialization helpers
 # ===================================================================
@@ -96,11 +125,22 @@ class AppContext:
     novel_store: NovelStore
     outline_generator: OutlineGenerator
     outline_manager: OutlineManager
+    chapters_per_volume: int
+    words_per_chapter: int
 
     def __init__(self, config_path: str) -> None:
         self.llm_client = LLMClient(config_path)
         self.style_manager = StyleManager()
         self.novel_store = NovelStore("data/novels")
+
+        # Load generation params from config.
+        gen_cfg = load_generation_config(Path(config_path))
+        self.chapters_per_volume = gen_cfg["chapters_per_volume"]
+        self.words_per_chapter = gen_cfg["words_per_chapter"]
+
+        # Load custom styles.
+        self.style_manager.load_custom_styles()
+
         self.outline_generator = OutlineGenerator(self.llm_client, self.style_manager)
         self.outline_manager = OutlineManager(
             novel_store=self.novel_store,
@@ -209,7 +249,14 @@ def cmd_new(ctx: AppContext) -> None:
     else:
         console.print("[red]无效选择，使用第一种风格。[/red]")
         style_name = styles[0]["name"]
-    console.print(f"  [green]已选择风格: {style_name}[/green]")
+    # Strip "[自定义] " prefix introduced by list_styles() so lookups work.
+    _display_name = style_name
+    if style_name.startswith("[自定义] "):
+        style_name = style_name[len("[自定义] "):]
+    console.print(f"  [green]已选择风格: {_display_name}[/green]")
+
+    # 3.5 Style customization.
+    style_name = _customize_style(ctx, style_name)
 
     # 4. Target words.
     target_words = IntPrompt.ask(
@@ -299,6 +346,7 @@ def cmd_new(ctx: AppContext) -> None:
             volume_outline = ctx.outline_manager.create_volume_outline(
                 novel_name=novel_name,
                 volume_num=1,
+                chapters_per_volume=ctx.chapters_per_volume,
             )
         except Exception as exc:
             console.print(f"[red]生成第一卷大纲失败: {exc}[/red]")
@@ -308,7 +356,7 @@ def cmd_new(ctx: AppContext) -> None:
 
     # 11. Ask to start writing.
     if Confirm.ask("是否开始生成第一卷？", default=True):
-        _write_volume(ctx, novel_name, 1)
+        _write_volume(ctx, novel_name, 1, ctx.words_per_chapter)
     else:
         console.print(
             "[yellow]可以稍后使用 'python cli.py write --novel "
@@ -355,6 +403,7 @@ def cmd_outline(ctx: AppContext, args: argparse.Namespace) -> None:
                 vol_outline = ctx.outline_manager.create_volume_outline(
                     novel_name=novel_name,
                     volume_num=volume_num,
+                    chapters_per_volume=ctx.chapters_per_volume,
                 )
             except Exception as exc:
                 console.print(f"[red]生成第{volume_num}卷大纲失败: {exc}[/red]")
@@ -378,7 +427,7 @@ def cmd_write(ctx: AppContext, args: argparse.Namespace) -> None:
     if novel_name is None:
         return
     volume_num: int = args.volume
-    words: int = args.words or 3000
+    words: int = args.words if args.words is not None else ctx.words_per_chapter
     _write_volume(ctx, novel_name, volume_num, words)
 
 
@@ -521,6 +570,8 @@ def cmd_status(ctx: AppContext, args: argparse.Namespace) -> None:
         "目标总字数",
         f"{summary['target_words']:,}" if summary["target_words"] else "-",
     )
+    table.add_row("每卷章数（配置）", str(ctx.chapters_per_volume))
+    table.add_row("每章字数（配置）", f"{ctx.words_per_chapter:,}")
     table.add_row(
         "已写卷数",
         f"{writen_volumes}/{planned_volumes}" if planned_volumes else str(writen_volumes),
@@ -602,6 +653,7 @@ def cmd_continue(ctx: AppContext, args: argparse.Namespace) -> None:
             vol_outline = ctx.outline_manager.create_volume_outline(
                 novel_name=novel_name,
                 volume_num=next_volume,
+                chapters_per_volume=ctx.chapters_per_volume,
             )
         except Exception as exc:
             console.print(f"[red]生成大纲失败: {exc}[/red]")
@@ -612,7 +664,7 @@ def cmd_continue(ctx: AppContext, args: argparse.Namespace) -> None:
             return
 
     # 2. Write the volume.
-    _write_volume(ctx, novel_name, next_volume)
+    _write_volume(ctx, novel_name, next_volume, ctx.words_per_chapter)
 
     # 3. Audit.
     console.print()
@@ -662,6 +714,162 @@ def cmd_list(ctx: AppContext) -> None:
 
     console.print()
     console.print(table)
+
+
+# ===================================================================
+# Style customization helper
+# ===================================================================
+
+
+def _customize_style(ctx: AppContext, style_name: str) -> str:
+    """Interactive style customization flow for the ``new`` command.
+
+    Shows the selected style's parameters, optionally lets the user tweak
+    them, and optionally saves the result as a new named custom style.
+
+    Args:
+        ctx: Application context.
+        style_name: Currently selected style name.
+
+    Returns:
+        The final style name to use (the original, or a new custom name).
+    """
+    # Show current parameters.
+    params = ctx.style_manager.get_style_params(style_name)
+    console.print()
+    console.print(Panel.fit(
+        f"[bold]叙事节奏:[/bold] {params['narrative_rhythm']}\n"
+        f"[bold]对话占比:[/bold] {params['dialogue_ratio']}\n"
+        f"[bold]描写细腻度:[/bold] {params['description_detail']}\n"
+        f"[bold]战斗描写风格:[/bold] {params['battle_style']}\n"
+        f"[bold]情感深度:[/bold] {params['emotional_depth']}\n"
+        f"[bold]句式风格:[/bold] {params['sentence_style']}",
+        title=f"[bold]风格参数: {style_name}[/bold]",
+        border_style="blue",
+    ))
+
+    if not Confirm.ask("是否要自定义此风格？(y/n)", default=False):
+        return style_name
+
+    console.print()
+    console.print("[bold cyan]逐项自定义参数（回车保留当前值）[/bold cyan]")
+
+    # 叙事节奏
+    rhythm_map = {"fast": "快速", "moderate": "中等", "slow": "慢速"}
+    current_rhythm = params["narrative_rhythm"]
+    console.print("  可选: fast(快速) / moderate(中等) / slow(慢速)")
+    rhythm_input = Prompt.ask(
+        f"  叙事节奏 [当前: {current_rhythm}]",
+        default="",
+    )
+    if rhythm_input.strip():
+        new_rhythm = rhythm_map.get(rhythm_input.strip(), current_rhythm)
+    else:
+        new_rhythm = current_rhythm
+
+    # 对话占比
+    dialogue_str = Prompt.ask(
+        f"  对话占比（0.0-1.0）[当前: {params['dialogue_ratio']}]",
+        default="",
+    )
+    new_dialogue = float(dialogue_str) if dialogue_str.strip() else params["dialogue_ratio"]
+
+    # 描写细腻度
+    detail_str = Prompt.ask(
+        f"  描写细腻度（0.0-1.0）[当前: {params['description_detail']}]",
+        default="",
+    )
+    new_detail = float(detail_str) if detail_str.strip() else params["description_detail"]
+
+    # 战斗描写风格
+    battle_input = Prompt.ask(
+        f"  战斗描写风格 [当前: {params['battle_style']}]",
+        default="",
+    )
+    new_battle = battle_input.strip() if battle_input.strip() else params["battle_style"]
+
+    # 情感深度
+    emotion_str = Prompt.ask(
+        f"  情感深度（0.0-1.0）[当前: {params['emotional_depth']}]",
+        default="",
+    )
+    new_emotion = float(emotion_str) if emotion_str.strip() else params["emotional_depth"]
+
+    # 句式风格
+    sentence_choices = {"concise": "简洁", "balanced": "平衡", "elaborate": "细腻"}
+    current_sentence = params["sentence_style"]
+    console.print("  可选: concise(简洁) / balanced(平衡) / elaborate(细腻)")
+    sentence_input = Prompt.ask(
+        f"  句式风格 [当前: {current_sentence}]",
+        default="",
+    )
+    if sentence_input.strip():
+        new_sentence = sentence_choices.get(sentence_input.strip(), current_sentence)
+    else:
+        new_sentence = current_sentence
+
+    # Show customized summary.
+    console.print()
+    console.print(Panel.fit(
+        f"[bold]叙事节奏:[/bold] {new_rhythm}\n"
+        f"[bold]对话占比:[/bold] {new_dialogue}\n"
+        f"[bold]描写细腻度:[/bold] {new_detail}\n"
+        f"[bold]战斗描写风格:[/bold] {new_battle}\n"
+        f"[bold]情感深度:[/bold] {new_emotion}\n"
+        f"[bold]句式风格:[/bold] {new_sentence}",
+        title="[bold]自定义后风格[/bold]",
+        border_style="green",
+    ))
+
+    # Ask to save.
+    if Confirm.ask("是否保存此自定义风格供以后使用？(y/n)", default=True):
+        custom_name = Prompt.ask("请输入自定义风格名称")
+        try:
+            style_params = ctx.style_manager.create_custom_style(
+                name=custom_name,
+                narrative_rhythm=new_rhythm,
+                dialogue_ratio=new_dialogue,
+                description_detail=new_detail,
+                battle_style=new_battle,
+                emotional_depth=new_emotion,
+                sentence_style=new_sentence,
+                description=custom_name,
+            )
+            ctx.style_manager.save_custom_style(custom_name, style_params)
+            console.print(f"[green]自定义风格 '{custom_name}' 已保存。[/green]")
+            return custom_name
+        except ValueError as exc:
+            console.print(f"[red]保存失败: {exc}[/red]")
+            console.print("[yellow]仍将使用自定义参数，但仅本次生效。[/yellow]")
+
+    # Even if not saved, create an in-memory temporary style for this novel.
+    temp_name = f"_temp_{style_name}_custom"
+    try:
+        ctx.style_manager.create_custom_style(
+            name=temp_name,
+            narrative_rhythm=new_rhythm,
+            dialogue_ratio=new_dialogue,
+            description_detail=new_detail,
+            battle_style=new_battle,
+            emotional_depth=new_emotion,
+            sentence_style=new_sentence,
+            description=f"临时自定义({style_name})",
+        )
+        return temp_name
+    except ValueError:
+        # Already exists from a prior temp creation; update in place.
+        ctx.style_manager.delete_custom_style(temp_name)
+        ctx.style_manager.create_custom_style(
+            name=temp_name,
+            narrative_rhythm=new_rhythm,
+            dialogue_ratio=new_dialogue,
+            description_detail=new_detail,
+            battle_style=new_battle,
+            emotional_depth=new_emotion,
+            sentence_style=new_sentence,
+            description=f"临时自定义({style_name})",
+        )
+        return temp_name
 
 
 # ===================================================================
@@ -992,7 +1200,7 @@ def build_parser() -> argparse.ArgumentParser:
     write_parser = sub.add_parser("write", help="生成指定卷的小说")
     write_parser.add_argument("--novel", type=str, required=True, help="小说名称")
     write_parser.add_argument("--volume", type=int, required=True, help="卷号")
-    write_parser.add_argument("--words", type=int, default=3000, help="每章目标字数")
+    write_parser.add_argument("--words", type=int, default=None, help="每章目标字数（覆盖config.yaml设置）")
 
     # --- audit ---
     audit_parser = sub.add_parser("audit", help="审计指定卷")

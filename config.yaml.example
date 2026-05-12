@@ -11,9 +11,9 @@ llm:
 
 # 生成参数默认值
 generation:
-  words_per_chapter: 3000      # 每章默认字数
-  chapters_per_volume: 15      # 每卷默认章数
-  target_total_words: 2000000  # 目标总字数
+  words_per_chapter: 5000        # 每章默认字数 (4000-6000)
+  chapters_per_volume: 50        # 每卷默认章数 (可自行修改)
+  target_total_words: 2000000    # 目标总字数
 
 # 审计参数
 audit:

@@ -7,8 +7,16 @@ structures with a StyleManager class providing access methods.
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass, field
-from typing import ClassVar
+from pathlib import Path
+from typing import Any, ClassVar
+
+logger = logging.getLogger(__name__)
+
+# Directory for persisting individual custom style JSON files
+CUSTOM_STYLES_DIR: str = "data/custom_styles/"
 
 
 @dataclass
@@ -46,6 +54,7 @@ class AuthorStyle:
     battle_notes: str = ""
     emotion_notes: str = ""
     sentence_notes: str = ""
+    genre_hints: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +210,10 @@ class StyleManager:
     _builtin_genres: ClassVar[dict[str, str]] = GENRE_PRESETS
 
     def __init__(self) -> None:
-        """Initialize StyleManager with an empty custom-style registry."""
+        """Initialize StyleManager and load any persisted custom styles."""
         self._custom_styles: dict[str, AuthorStyle] = {}
+        self._custom_bases: dict[str, str | None] = {}
+        self._load_custom_styles_from_dir()
 
     # ------------------------------------------------------------------
     # Author style methods
@@ -233,26 +244,23 @@ class StyleManager:
     def get_style_prompt(self, style_name: str) -> str:
         """Generate a prompt-ready Chinese description of a writing style.
 
-        The returned string is designed to be injected into the system
-        prompt of an LLM chapter-generation call.
+        Works for both built-in presets (which carry rich detail text) and
+        custom styles (where the prompt is built from core parameters).
 
         Args:
             style_name: Name of the author style preset.
 
         Returns:
             A formatted multi-line string describing the writing style.
-
-        Example::
-
-            >>> manager = StyleManager()
-            >>> print(manager.get_style_prompt("辰东式热血"))
-            写作风格要求：
-            - 叙事节奏：快节奏，战斗与高潮密集
-            - 对话占比：中等（约30%），对话简洁有力
-            ...
         """
         style = self.get_style(style_name)
 
+        # Custom styles: build prompt from core parameters so it always
+        # reflects the user's current values, even after edits.
+        if style_name in self._custom_styles:
+            return self._build_prompt_from_params(style)
+
+        # Built-in styles: use rich pre-written detail fields.
         dialogue_pct = int(style.dialogue_ratio * 100)
 
         def _dialogue_label(ratio: float) -> str:
@@ -273,21 +281,24 @@ class StyleManager:
             f"- 句式风格：{style.sentence_notes}"
         )
 
-    def create_custom_style(self, name: str, **params: str | float) -> AuthorStyle:
-        """Define a custom author style.
+    def create_custom_style(
+        self, name: str, base_style: str | None = None, **params: str | float
+    ) -> dict[str, Any]:
+        """Define a custom author style, optionally based on an existing one.
 
         Args:
             name: Unique name for the custom style.
-            **params: Style parameters. Supported keys match the
-                      :class:`AuthorStyle` fields:
-                      description, narrative_rhythm, dialogue_ratio,
-                      description_detail, battle_style, emotional_depth,
-                      sentence_style, rhythm_detail, dialogue_detail,
-                      detail_notes, battle_notes, emotion_notes,
-                      sentence_notes.
+            base_style: If provided, start from this style's parameters and
+                        override with any supplied **params.
+            **params: Style parameter overrides. Supported keys:
+                      narrative_rhythm, dialogue_ratio, description_detail,
+                      battle_style, emotional_depth, sentence_style,
+                      genre_hints, description.
 
         Returns:
-            The newly created :class:`AuthorStyle` instance.
+            A dict of the core style parameters (narrative_rhythm,
+            dialogue_ratio, description_detail, battle_style,
+            emotional_depth, sentence_style, genre_hints).
 
         Raises:
             ValueError: If the style name conflicts with a built-in or
@@ -302,31 +313,50 @@ class StyleManager:
                 f"自定义风格'{name}'已存在。请使用其他名称或先删除旧风格。"
             )
 
-        # Provide defaults for missing fields so callers can be minimal.
-        defaults: dict[str, str | float] = {
-            "description": name,
-            "narrative_rhythm": "中等",
-            "dialogue_ratio": 0.35,
-            "description_detail": 0.60,
-            "battle_style": "标准战斗描写",
-            "emotional_depth": 0.60,
-            "sentence_style": "平衡",
-            "rhythm_detail": "中等节奏",
-            "dialogue_detail": "对话自然流畅",
-            "detail_notes": "描写细腻度适中",
-            "battle_notes": "标准战斗描写",
-            "emotion_notes": "情感表达自然",
-            "sentence_notes": "句式平衡",
-        }
-        merged = {**defaults, **params}
-        merged["name"] = name
+        # Determine base parameter values.
+        if base_style is not None:
+            base = self.get_style(base_style)
+            base_params: dict[str, Any] = {
+                "narrative_rhythm": base.narrative_rhythm,
+                "dialogue_ratio": base.dialogue_ratio,
+                "description_detail": base.description_detail,
+                "battle_style": base.battle_style,
+                "emotional_depth": base.emotional_depth,
+                "sentence_style": base.sentence_style,
+                "genre_hints": "",
+            }
+            description = params.pop("description", f"{name}（基于{base_style}）")
+        else:
+            base_params = {
+                "narrative_rhythm": "中等",
+                "dialogue_ratio": 0.35,
+                "description_detail": 0.60,
+                "battle_style": "标准战斗描写",
+                "emotional_depth": 0.60,
+                "sentence_style": "平衡",
+                "genre_hints": "",
+            }
+            description = params.pop("description", name)
 
-        style = AuthorStyle(**merged)  # type: ignore[arg-type]
+        # Merge overrides into base.
+        core_fields = {
+            "narrative_rhythm", "dialogue_ratio", "description_detail",
+            "battle_style", "emotional_depth", "sentence_style", "genre_hints",
+        }
+        for k, v in params.items():
+            if k in core_fields:
+                base_params[k] = v
+
+        # Build the AuthorStyle with auto-generated detail text.
+        style = self._params_to_author_style(name, base_params, description)
         self._custom_styles[name] = style
-        return style
+        self._custom_bases[name] = base_style
+
+        # Return the core params dict (caller can save it later).
+        return dict(base_params)
 
     def delete_custom_style(self, name: str) -> None:
-        """Remove a custom style.
+        """Remove a custom style from memory and persistent storage.
 
         Args:
             name: Name of the custom style to delete.
@@ -337,9 +367,19 @@ class StyleManager:
         if name not in self._custom_styles:
             raise KeyError(f"自定义风格'{name}'不存在。")
         del self._custom_styles[name]
+        self._custom_bases.pop(name, None)
+        # Also remove the persisted JSON file if present.
+        file_path = Path(CUSTOM_STYLES_DIR) / f"{name}.json"
+        try:
+            file_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def list_styles(self) -> list[dict[str, str]]:
         """Return all available author styles with descriptions.
+
+        Built-in styles are listed as-is; custom styles are prefixed with
+        ``[自定义]`` so UIs can distinguish them.
 
         Returns:
             A list of dicts, each with ``name`` and ``description`` keys.
@@ -348,8 +388,76 @@ class StyleManager:
         for name, style in self._builtin_authors.items():
             results.append({"name": name, "description": style.description})
         for name, style in self._custom_styles.items():
-            results.append({"name": name, "description": style.description})
+            results.append({
+                "name": f"[自定义] {name}",
+                "description": style.description,
+            })
         return results
+
+    def get_style_params(self, style_name: str) -> dict[str, Any]:
+        """Return the core customization parameters of a style as a dict.
+
+        Args:
+            style_name: Name of the style to inspect.
+
+        Returns:
+            Dict with keys: narrative_rhythm, dialogue_ratio,
+            description_detail, battle_style, emotional_depth,
+            sentence_style, and the extended detail notes.
+        """
+        style = self.get_style(style_name)
+        return {
+            "narrative_rhythm": style.narrative_rhythm,
+            "dialogue_ratio": style.dialogue_ratio,
+            "description_detail": style.description_detail,
+            "battle_style": style.battle_style,
+            "emotional_depth": style.emotional_depth,
+            "sentence_style": style.sentence_style,
+            "rhythm_detail": style.rhythm_detail,
+            "dialogue_detail": style.dialogue_detail,
+            "detail_notes": style.detail_notes,
+            "battle_notes": style.battle_notes,
+            "emotion_notes": style.emotion_notes,
+            "sentence_notes": style.sentence_notes,
+        }
+
+    def save_custom_style(
+        self, name: str, style_params: dict[str, Any]
+    ) -> None:
+        """Persist a single custom style to its own JSON file.
+
+        The file is written under ``CUSTOM_STYLES_DIR/<name>.json``.
+        Call this separately after :meth:`create_custom_style` to make
+        the style survive restarts.
+
+        Args:
+            name: Name of the custom style to save.
+            style_params: Dict with all style fields (narrative_rhythm,
+                          dialogue_ratio, description_detail, battle_style,
+                          emotional_depth, sentence_style, genre_hints).
+        """
+        styles_dir = Path(CUSTOM_STYLES_DIR)
+        styles_dir.mkdir(parents=True, exist_ok=True)
+
+        data: dict[str, Any] = {
+            "name": name,
+            "base_style": self._custom_bases.get(name, ""),
+            "params": style_params,
+        }
+        file_path = styles_dir / f"{name}.json"
+        file_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.info("已保存自定义风格 '%s' 到 %s", name, file_path)
+
+    def load_custom_styles(self) -> dict[str, dict[str, Any]]:
+        """Load all saved custom styles from the custom-styles directory.
+
+        Returns:
+            Dict mapping style name to core params dict.
+        """
+        return self._load_custom_styles_from_dir()
 
     # ------------------------------------------------------------------
     # Genre methods
@@ -386,3 +494,176 @@ class StyleManager:
         names: list[str] = list(self._builtin_authors.keys())
         names.extend(self._custom_styles.keys())
         return names
+
+    def _load_custom_styles_from_dir(self) -> dict[str, dict[str, Any]]:
+        """Scan ``CUSTOM_STYLES_DIR`` for JSON files and register each."""
+        styles_dir = Path(CUSTOM_STYLES_DIR)
+        if not styles_dir.is_dir():
+            return {}
+
+        loaded: dict[str, dict[str, Any]] = {}
+        for file_path in sorted(styles_dir.glob("*.json")):
+            try:
+                data = json.loads(file_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning(
+                    "无法读取自定义风格文件 %s: %s", file_path, exc
+                )
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            name = data.get("name") or file_path.stem
+            params = data.get("params")
+            if not isinstance(params, dict):
+                continue
+
+            if name in self._builtin_authors:
+                continue
+            if name in self._custom_styles:
+                loaded[name] = params
+                continue
+
+            base_style = data.get("base_style", "") or None
+            description = str(name)
+            if base_style:
+                description = f"{name}（基于{base_style}）"
+
+            style = self._params_to_author_style(name, params, description)
+            self._custom_styles[name] = style
+            self._custom_bases[name] = base_style
+            loaded[name] = params
+
+        if loaded:
+            logger.info(
+                "从 %s 加载了 %d 个自定义风格", CUSTOM_STYLES_DIR, len(loaded)
+            )
+        return loaded
+
+    @staticmethod
+    def _params_to_author_style(
+        name: str, params: dict[str, Any], description: str = ""
+    ) -> AuthorStyle:
+        """Build an :class:`AuthorStyle` from a core-params dict.
+
+        Missing detail fields are filled with auto-generated text so
+        :meth:`_build_prompt_from_params` produces quality output.
+        """
+        narrative_rhythm = str(params.get("narrative_rhythm", "中等"))
+        dialogue_ratio = float(params.get("dialogue_ratio", 0.35))
+        description_detail = float(params.get("description_detail", 0.60))
+        battle_style = str(params.get("battle_style", "标准战斗描写"))
+        emotional_depth = float(params.get("emotional_depth", 0.60))
+        sentence_style = str(params.get("sentence_style", "平衡"))
+        genre_hints = str(params.get("genre_hints", ""))
+
+        rhythm_map: dict[str, str] = {
+            "快速": "快节奏，战斗与高潮密集，章节结尾常留悬念",
+            "fast": "快节奏，战斗与高潮密集，章节结尾常留悬念",
+            "中等": "中等节奏，张弛有度，文戏与武戏交替推进",
+            "moderate": "中等节奏，张弛有度，文戏与武戏交替推进",
+            "慢速": "慢节奏，注重铺垫与逻辑自洽，世界观逐步展开",
+            "slow": "慢节奏，注重铺垫与逻辑自洽，世界观逐步展开",
+        }
+
+        sentence_map: dict[str, str] = {
+            "简洁": "简洁有力，善用短句营造紧张感",
+            "concise": "简洁有力，善用短句营造紧张感",
+            "平衡": "流畅自然，句式均衡",
+            "balanced": "流畅自然，句式均衡",
+            "细腻": "文笔细腻，句式多变，注重细节刻画",
+            "elaborate": "文笔细腻，句式多变，注重细节刻画",
+        }
+
+        detail_map: dict[float, str] = {
+            0.9: "极高细腻度，对世界观设定、环境氛围有详尽描写",
+            0.8: "细腻入微，善于捕捉微表情与环境细节",
+            0.7: "中等偏高，注重场景氛围营造，擅长用环境烘托情绪",
+            0.6: "描写细腻度适中，场景为剧情服务",
+            0.5: "中等偏低，重点描写核心元素，环境描写简洁",
+            0.4: "简明扼要，以动作和对话驱动叙事",
+        }
+
+        emotion_map: dict[float, str] = {
+            0.9: "深刻复杂，善写人物内心矛盾与成长，情感线细腻绵长",
+            0.8: "深沉内敛，人物情感在漫长铺垫中自然流露",
+            0.7: "温暖真挚，情感表达自然而克制",
+            0.6: "情感表达自然，重行动轻言语",
+            0.5: "简单直接，以热血与爽感为主",
+            0.4: "轻情感重剧情，情感为辅线快速推进",
+        }
+
+        def _closest_key(d: dict[float, str], target: float) -> str:
+            return min(d.keys(), key=lambda k: abs(k - target))
+
+        rhythm_detail = rhythm_map.get(
+            narrative_rhythm, "节奏适中，根据剧情需要调整"
+        )
+        sentence_notes = sentence_map.get(
+            sentence_style, "句式平衡，阅读流畅"
+        )
+
+        if dialogue_ratio <= 0.25:
+            dialogue_detail = "以叙述和描写推动剧情，对话简洁直接"
+        elif dialogue_ratio <= 0.35:
+            dialogue_detail = "对话简洁有力，语言个性鲜明"
+        else:
+            dialogue_detail = "以对话推动剧情，角色互动丰富，潜台词丰富"
+
+        detail_notes = detail_map.get(description_detail) or detail_map[
+            _closest_key(detail_map, description_detail)
+        ]
+        battle_notes_val = battle_style
+        emotion_notes = emotion_map.get(emotional_depth) or emotion_map[
+            _closest_key(emotion_map, emotional_depth)
+        ]
+
+        return AuthorStyle(
+            name=name,
+            description=description or name,
+            narrative_rhythm=narrative_rhythm,
+            dialogue_ratio=dialogue_ratio,
+            description_detail=description_detail,
+            battle_style=battle_style,
+            emotional_depth=emotional_depth,
+            sentence_style=sentence_style,
+            rhythm_detail=rhythm_detail,
+            dialogue_detail=dialogue_detail,
+            detail_notes=detail_notes,
+            battle_notes=battle_notes_val,
+            emotion_notes=emotion_notes,
+            sentence_notes=sentence_notes,
+            genre_hints=genre_hints,
+        )
+
+    def _build_prompt_from_params(self, style: AuthorStyle) -> str:
+        """Build a prompt string from an AuthorStyle's parameters.
+
+        Used for custom styles where the prompt is generated from the
+        core parameters instead of hand-written detail fields.
+        """
+        dialogue_pct = int(style.dialogue_ratio * 100)
+
+        def _dialogue_label(ratio: float) -> str:
+            if ratio <= 0.25:
+                return "偏低"
+            if ratio <= 0.35:
+                return "中等"
+            return "偏高"
+
+        lines = [
+            "写作风格要求：",
+            f"- 叙事节奏：{style.rhythm_detail}",
+            f"- 对话占比：{_dialogue_label(style.dialogue_ratio)}"
+            f"（约{dialogue_pct}%），{style.dialogue_detail}",
+            f"- 描写细腻度：{style.detail_notes}",
+            f"- 战斗描写：{style.battle_notes}",
+            f"- 情感描写：{style.emotion_notes}",
+            f"- 句式风格：{style.sentence_notes}",
+        ]
+
+        if getattr(style, "genre_hints", ""):
+            lines.append(f"- 流派倾向：{style.genre_hints}")
+
+        return "\n".join(lines)

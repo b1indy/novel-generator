@@ -314,7 +314,8 @@ class ChapterWriter:
         volume_title = volume_outline.get("volume_title", f"第{volume_num}卷")
         blocks.append(
             f"请为小说《{novel_title}》创作第{volume_num}卷「{volume_title}」"
-            f"的第{chapter_num}章。目标字数约{target_words}字。\n"
+            f"的第{chapter_num}章。\n"
+            f"本章目标字数：约{target_words}字。\n"
         )
 
         # -- Total outline summary --

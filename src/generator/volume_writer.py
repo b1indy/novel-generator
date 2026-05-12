@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Any
+
+import yaml
 
 from ..config.style import StyleManager
 from ..llm.client import LLMClient
@@ -130,7 +133,7 @@ class VolumeWriter:
         self,
         novel_name: str,
         volume_num: int,
-        target_words_per_chapter: int = 3000,
+        words_per_chapter: int = 5000,
     ) -> dict[str, Any]:
         """Orchestrate writing an entire volume, chapter by chapter.
 
@@ -152,8 +155,8 @@ class VolumeWriter:
         Args:
             novel_name: Directory-safe novel identifier.
             volume_num: Volume number to write (1-indexed).
-            target_words_per_chapter: Target Chinese characters per
-                chapter. Default 3000.
+            words_per_chapter: Target Chinese characters per
+                chapter. Default 5000.
 
         Returns:
             Dict with keys: ``volume``, ``title``, ``chapter_count``,
@@ -187,7 +190,7 @@ class VolumeWriter:
         prev_chapters = context.get("last_chapters", [])
         self._info(
             f"开始生成 第{volume_num}卷「{volume_title}」"
-            f"（共{len(chapter_plan)}章，每章目标{target_words_per_chapter}字）"
+            f"（共{len(chapter_plan)}章，每章目标{words_per_chapter}字）"
         )
 
         # -- Step 3: chapter loop --
@@ -232,7 +235,7 @@ class VolumeWriter:
                     chapter_plan_item=chapter_plan_item,
                     total_outline=total_outline,
                     prev_context=prev_context,
-                    target_words=target_words_per_chapter,
+                    target_words=words_per_chapter,
                 )
             except Exception:
                 logger.exception(
@@ -473,6 +476,46 @@ class VolumeWriter:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_config(config_path: str = "config.yaml") -> dict[str, Any]:
+        """Load generation defaults from a YAML config file.
+
+        If the file does not exist or cannot be parsed, returns sensible
+        defaults so the CLI does not always need to pass these parameters.
+
+        Args:
+            config_path: Path to the ``config.yaml`` file.
+
+        Returns:
+            A dict with keys ``words_per_chapter`` (int) and
+            ``chapters_per_volume`` (int).
+        """
+        defaults: dict[str, Any] = {
+            "words_per_chapter": 5000,
+            "chapters_per_volume": 50,
+        }
+        config_file = Path(config_path)
+        if not config_file.exists():
+            logger.debug("config.yaml not found at %s, using defaults", config_path)
+            return defaults
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            if isinstance(data, dict):
+                generation = data.get("generation", {})
+                if isinstance(generation, dict):
+                    defaults["words_per_chapter"] = generation.get(
+                        "words_per_chapter", defaults["words_per_chapter"]
+                    )
+                    defaults["chapters_per_volume"] = generation.get(
+                        "chapters_per_volume", defaults["chapters_per_volume"]
+                    )
+        except Exception:
+            logger.warning(
+                "Failed to parse %s, using defaults", config_path, exc_info=True
+            )
+        return defaults
 
     @staticmethod
     def _count_chinese_chars(text: str) -> int:

@@ -162,6 +162,7 @@ class OutlineManager:
         self,
         novel_name: str,
         volume_num: int,
+        chapters_per_volume: int = 50,
     ) -> dict[str, Any]:
         """Generate and persist the outline for a specific volume.
 
@@ -174,6 +175,8 @@ class OutlineManager:
         Args:
             novel_name: Novel identifier.
             volume_num: Volume number to generate (1-indexed).
+            chapters_per_volume: Number of chapters to plan for this volume.
+                Defaults to 50.
 
         Returns:
             The generated volume outline dict.
@@ -199,6 +202,7 @@ class OutlineManager:
             prev_summaries=prev_summaries,
             last_chapters=last_chapters,
             memory_context=memory_context,
+            chapters_per_volume=chapters_per_volume,
         )
 
         # Attach metadata.
