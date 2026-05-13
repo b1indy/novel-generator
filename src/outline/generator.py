@@ -40,7 +40,7 @@ _SYSTEM_PROMPT_TOTAL = """\
       "volume": 1,
       "title": "卷标题",
       "summary": "本卷剧情概要（1-2句话）",
-      "estimated_chapters": 15,
+      "estimated_chapters": 50,
       "key_milestones": ["关键剧情节点1", "关键剧情节点2"]
     }
   ],
@@ -51,7 +51,7 @@ _SYSTEM_PROMPT_TOTAL = """\
 在规划大纲时请注意：
 - 主线剧情需有清晰的起承转合
 - 角色之间要有合理的关系网络和冲突
-- 分卷规划需考虑每卷的字数目标（每卷约10-20章）
+- 分卷规划需根据用户指定的每卷章数目标来设计（每卷默认50章左右）
 - 大纲结构要适合超长篇小说（200万+字），为后续发展留下空间
 - 世界观设定需丰富且有层次，能支撑长篇叙事
 """
@@ -77,6 +77,7 @@ _SYSTEM_PROMPT_VOLUME = """\
 ```
 
 在规划卷大纲时请注意：
+- chapter_plan 数组必须恰好包含指定数量的章节（由用户参数决定，默认50章），不多不少
 - 卷大纲需与总大纲保持一致，推进主线剧情
 - 每章需有明确的剧情推进和角色发展
 - 注意前后卷之间的衔接，避免剧情断裂
@@ -222,8 +223,9 @@ class OutlineGenerator:
         style_prompt = self._style.get_style_prompt(style_name)
         genre_prompt = self._style.get_genre_prompt(genre)
 
+        chapters_per_vol = 50  # default; actual is read from config by caller
         chapters_estimate = max(10, target_words // 3000)
-        volumes_estimate = max(3, chapters_estimate // 15)
+        volumes_estimate = max(3, chapters_estimate // chapters_per_vol)
 
         user_prompt = (
             f"请为网络小说《{novel_title}》设计总大纲。\n\n"
@@ -399,13 +401,36 @@ class OutlineGenerator:
             chapters_per_volume,
         )
 
-        response = self._llm.chat(
-            messages,
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
-        )
+        # Retry loop: if chapter_plan count deviates significantly from target,
+        # re-ask the LLM with a stricter prompt (up to 3 retries).
+        outline: dict[str, Any] = {}
+        for attempt in range(4):
+            response = self._llm.chat(
+                messages,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+            )
 
-        outline = _extract_json(response)
+            outline = _extract_json(response)
+
+            chapter_plan = outline.get("chapter_plan", [])
+            actual_count = len(chapter_plan)
+            if abs(actual_count - chapters_per_volume) <= 5:
+                break  # close enough
+
+            logger.warning(
+                "Volume %d outline has %d chapters (target %d), retry %d/3",
+                volume_num, actual_count, chapters_per_volume, attempt + 1,
+            )
+            # Add a correction message for the next attempt.
+            messages.append({"role": "assistant", "content": response})
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"你生成了{actual_count}章，但要求是恰好{chapters_per_volume}章。"
+                    f"请重新生成，chapter_plan 数组必须恰好包含{chapters_per_volume}个元素。"
+                ),
+            })
 
         # Validate required keys.
         required = {"volume_title", "volume_arc", "chapter_plan", "synopsis"}

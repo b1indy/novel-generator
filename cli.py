@@ -64,6 +64,72 @@ def _setup_encoding() -> None:
 
 _setup_encoding()
 del _setup_encoding
+
+# ---------------------------------------------------------------------------
+# Readline-based input helpers (replaces rich.prompt for CJK safety)
+#
+#   Rich's Prompt.ask() bypasses readline and manages its own cursor via
+#   ANSI escape codes.  Its column arithmetic breaks on CJK characters
+#   (2 columns wide, 3 UTF-8 bytes), causing backspace to erase part of
+#   previously printed output.  These wrappers use readline (or
+#   gnureadline) for actual input, while rich handles display-only output.
+# ---------------------------------------------------------------------------
+
+
+def _ask(prompt: str, default: str | None = None, choices: list[str] | None = None) -> str:
+    """Read a line of input via readline, with optional default and choices."""
+    import readline  # noqa: F811 — may be gnureadline after _setup_encoding
+
+    suffix = ""
+    if default is not None:
+        suffix = f" [{default}]"
+    if choices:
+        suffix = f" ({'/'.join(choices)}){suffix}"
+
+    while True:
+        try:
+            value = input(f"{prompt}{suffix}: ").strip()
+        except EOFError:
+            return default or ""
+        if not value and default is not None:
+            return default
+        if choices and value not in choices:
+            console.print(f"[red]无效输入，请选择: {', '.join(choices)}[/red]")
+            continue
+        if value:
+            return value
+
+
+def _confirm(prompt: str, default: bool = True) -> bool:
+    """Ask a yes/no question via readline."""
+    hint = "Y/n" if default else "y/N"
+    try:
+        value = input(f"{prompt} [{hint}]: ").strip().lower()
+    except EOFError:
+        return default
+    if not value:
+        return default
+    return value in ("y", "yes", "是")
+
+
+def _int_ask(prompt: str, default: int | None = None) -> int:
+    """Ask for an integer via readline."""
+    suffix = f" [{default}]" if default is not None else ""
+    while True:
+        try:
+            value = input(f"{prompt}{suffix}: ").strip()
+        except EOFError:
+            if default is not None:
+                return default
+            continue
+        if not value and default is not None:
+            return default
+        try:
+            return int(value)
+        except ValueError:
+            console.print("[red]请输入有效的数字。[/red]")
+
+
 from pathlib import Path
 from typing import Any
 
@@ -76,13 +142,14 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich.prompt import Prompt, Confirm, IntPrompt
+# Prompt/Confirm/IntPrompt removed — using readline-based _ask/_confirm/_int_ask
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 
 # ---------------------------------------------------------------------------
 # Project imports
 # ---------------------------------------------------------------------------
 from src.llm.client import LLMClient, LLMError
+from src.llm.token_tracker import TokenTracker
 from src.config.style import StyleManager
 from src.storage.novel_store import NovelStore
 from src.storage.table_store import TableStore
@@ -134,7 +201,13 @@ def load_generation_config(config_path: Path) -> dict[str, int]:
     ``words_per_chapter``, defaulting to 50 and 5000 respectively when
     the section or keys are missing.
     """
-    defaults = {"chapters_per_volume": 50, "words_per_chapter": 5000}
+    defaults = {
+        "chapters_per_volume": 50,
+        "words_per_chapter": 5000,
+        "batch_size": 3,
+        "generation_mode": "continuous",
+        "round_size": 15,
+    }
     try:
         raw = yaml.safe_load(config_path.read_text())
     except (yaml.YAMLError, OSError):
@@ -150,6 +223,15 @@ def load_generation_config(config_path: Path) -> dict[str, int]:
         ),
         "words_per_chapter": int(
             generation.get("words_per_chapter", defaults["words_per_chapter"])
+        ),
+        "batch_size": int(
+            generation.get("batch_size", defaults["batch_size"])
+        ),
+        "generation_mode": str(
+            generation.get("generation_mode", defaults["generation_mode"])
+        ),
+        "round_size": int(
+            generation.get("round_size", defaults["round_size"])
         ),
     }
 
@@ -173,9 +255,13 @@ class AppContext:
     outline_manager: OutlineManager
     chapters_per_volume: int
     words_per_chapter: int
+    batch_size: int
+    generation_mode: str
+    round_size: int
 
     def __init__(self, config_path: str) -> None:
-        self.llm_client = LLMClient(config_path)
+        self.token_tracker = TokenTracker()
+        self.llm_client = LLMClient(config_path, token_tracker=self.token_tracker)
         self.style_manager = StyleManager()
         self.novel_store = NovelStore("data/novels")
 
@@ -183,6 +269,9 @@ class AppContext:
         gen_cfg = load_generation_config(Path(config_path))
         self.chapters_per_volume = gen_cfg["chapters_per_volume"]
         self.words_per_chapter = gen_cfg["words_per_chapter"]
+        self.batch_size = gen_cfg["batch_size"]
+        self.generation_mode = gen_cfg["generation_mode"]
+        self.round_size = gen_cfg["round_size"]
 
         # Load custom styles.
         self.style_manager.load_custom_styles()
@@ -227,6 +316,7 @@ class AppContext:
             novel_store=self.novel_store,
             table_store=self.make_table_store(novel_name),
             summary_generator=SummaryGenerator(self.llm_client),
+            round_size=self.round_size,
         )
 
     def make_auditor(self) -> Auditor:
@@ -247,14 +337,14 @@ def cmd_new(ctx: AppContext) -> None:
     ))
 
     # 1. Novel name.
-    novel_name = Prompt.ask("请输入小说名称（用于目录标识，英文/拼音）")
+    novel_name = _ask("请输入小说名称（用于目录标识，英文/拼音）")
     if ctx.novel_store.novel_exists(novel_name):
         console.print(
             f"[red]小说'{novel_name}'已存在。请使用其他名称。[/red]"
         )
         return
 
-    title = Prompt.ask("请输入小说标题（中文显示名称）", default=novel_name)
+    title = _ask("请输入小说标题（中文显示名称）", default=novel_name)
 
     # 2. Select genre.
     genres = ctx.style_manager.list_genres()
@@ -262,11 +352,7 @@ def cmd_new(ctx: AppContext) -> None:
     console.print("[bold]可用流派：[/bold]")
     for i, g in enumerate(genres, 1):
         console.print(f"  {i}. {g}")
-    genre_idx = IntPrompt.ask(
-        "请选择流派（输入编号）",
-        default=1,
-        show_choices=False,
-    )
+    genre_idx = _int_ask("请选择流派（输入编号）", default=1)
     if 1 <= genre_idx <= len(genres):
         genre = genres[genre_idx - 1]
     else:
@@ -285,11 +371,7 @@ def cmd_new(ctx: AppContext) -> None:
     for i, s in enumerate(styles, 1):
         style_table.add_row(str(i), s["name"], s["description"])
     console.print(style_table)
-    style_idx = IntPrompt.ask(
-        "请选择作家风格（输入编号）",
-        default=1,
-        show_choices=False,
-    )
+    style_idx = _int_ask("请选择作家风格（输入编号）", default=1)
     if 1 <= style_idx <= len(styles):
         style_name = styles[style_idx - 1]["name"]
     else:
@@ -305,10 +387,7 @@ def cmd_new(ctx: AppContext) -> None:
     style_name = _customize_style(ctx, style_name)
 
     # 4. Target words.
-    target_words = IntPrompt.ask(
-        "请输入目标总字数",
-        default=2_000_000,
-    )
+    target_words = _int_ask("请输入目标总字数", default=2_000_000)
 
     # 5. Show summary and confirm.
     console.print()
@@ -323,11 +402,12 @@ def cmd_new(ctx: AppContext) -> None:
     )
     console.print(summary_panel)
 
-    if not Confirm.ask("确认创建？", default=True):
+    if not _confirm("确认创建？", default=True):
         console.print("[yellow]已取消。[/yellow]")
         return
 
     # 6. Create novel and generate total outline.
+    ctx.token_tracker.set_category("outline")
     with console.status("[cyan]正在创建小说并生成总大纲...[/cyan]", spinner="dots"):
         try:
             ctx.novel_store.create_novel(
@@ -360,11 +440,7 @@ def cmd_new(ctx: AppContext) -> None:
         # Display the outline.
         _display_total_outline(total_outline)
 
-        choice = Prompt.ask(
-            "大纲是否满意？",
-            choices=["y", "n", "q"],
-            default="y",
-        )
+        choice = _ask("大纲是否满意？", choices=["y", "n", "q"], default="y")
         if choice == "y":
             break
         if choice == "q":
@@ -372,8 +448,8 @@ def cmd_new(ctx: AppContext) -> None:
             return
 
         # Changes requested.
-        feedback = Prompt.ask("请描述大纲的问题或需要修改的方向")
-        change_request = Prompt.ask("具体修改要求", default="请根据上述反馈修改大纲")
+        feedback = _ask("请描述大纲的问题或需要修改的方向")
+        change_request = _ask("具体修改要求", default="请根据上述反馈修改大纲")
         with console.status("[cyan]正在优化大纲...[/cyan]", spinner="dots"):
             try:
                 total_outline = ctx.outline_manager.update_total_outline(
@@ -401,7 +477,7 @@ def cmd_new(ctx: AppContext) -> None:
     _display_volume_outline(volume_outline, volume_num=1)
 
     # 11. Ask to start writing.
-    if Confirm.ask("是否开始生成第一卷？", default=True):
+    if _confirm("是否开始生成第一卷？", default=True):
         _write_volume(ctx, novel_name, 1, ctx.words_per_chapter)
     else:
         console.print(
@@ -424,8 +500,8 @@ def cmd_outline(ctx: AppContext, args: argparse.Namespace) -> None:
     if args.update:
         # Update total outline.
         console.print("[bold]更新总大纲[/bold]")
-        feedback = Prompt.ask("请描述修改原因或上下文")
-        change_request = Prompt.ask("具体修改要求", default="请根据上述反馈修改大纲")
+        feedback = _ask("请描述修改原因或上下文")
+        change_request = _ask("具体修改要求", default="请根据上述反馈修改大纲")
         with console.status("[cyan]正在优化总大纲...[/cyan]", spinner="dots"):
             try:
                 updated = ctx.outline_manager.update_total_outline(
@@ -474,7 +550,8 @@ def cmd_write(ctx: AppContext, args: argparse.Namespace) -> None:
         return
     volume_num: int = args.volume
     words: int = args.words if args.words is not None else ctx.words_per_chapter
-    _write_volume(ctx, novel_name, volume_num, words)
+    auto_audit: bool = getattr(args, "audit", False)
+    _write_volume(ctx, novel_name, volume_num, words, auto_audit=auto_audit)
 
 
 # ===================================================================
@@ -521,6 +598,7 @@ def cmd_audit(ctx: AppContext, args: argparse.Namespace) -> None:
     outline_text = json.dumps(volume_outline, ensure_ascii=False, indent=2)
 
     # Run audit.
+    ctx.token_tracker.set_category("auditing")
     auditor = ctx.make_auditor()
     with console.status("[cyan]正在进行审计（LLM调用中）...[/cyan]", spinner="dots"):
         try:
@@ -543,7 +621,7 @@ def cmd_audit(ctx: AppContext, args: argparse.Namespace) -> None:
             console.print("[green]没有问题需要修复。[/green]")
             return
 
-        if not Confirm.ask(
+        if not _confirm(
             f"发现 {len(report.all_issues)} 个问题，是否自动修复？", default=True
         ):
             return
@@ -705,7 +783,7 @@ def cmd_continue(ctx: AppContext, args: argparse.Namespace) -> None:
             console.print(f"[red]生成大纲失败: {exc}[/red]")
             return
         _display_volume_outline(vol_outline, volume_num=next_volume)
-        if not Confirm.ask("大纲是否满意，继续生成？", default=True):
+        if not _confirm("大纲是否满意，继续生成？", default=True):
             console.print("[yellow]已取消。[/yellow]")
             return
 
@@ -714,7 +792,7 @@ def cmd_continue(ctx: AppContext, args: argparse.Namespace) -> None:
 
     # 3. Audit.
     console.print()
-    if Confirm.ask("是否对刚生成的卷进行审计？", default=True):
+    if _confirm("是否对刚生成的卷进行审计？", default=True):
         # Fake a namespace for cmd_audit arguments.
         audit_args = argparse.Namespace(
             novel=novel_name, volume=next_volume, fix=None
@@ -763,6 +841,17 @@ def cmd_list(ctx: AppContext) -> None:
 
 
 # ===================================================================
+# Command: token
+# ===================================================================
+
+
+def cmd_token(ctx: AppContext) -> None:
+    """Display token usage statistics for the current session."""
+    console.print()
+    console.print(ctx.token_tracker.report())
+
+
+# ===================================================================
 # Style customization helper
 # ===================================================================
 
@@ -794,7 +883,7 @@ def _customize_style(ctx: AppContext, style_name: str) -> str:
         border_style="blue",
     ))
 
-    if not Confirm.ask("是否要自定义此风格？(y/n)", default=False):
+    if not _confirm("是否要自定义此风格？(y/n)", default=False):
         return style_name
 
     console.print()
@@ -804,51 +893,33 @@ def _customize_style(ctx: AppContext, style_name: str) -> str:
     rhythm_map = {"fast": "快速", "moderate": "中等", "slow": "慢速"}
     current_rhythm = params["narrative_rhythm"]
     console.print("  可选: fast(快速) / moderate(中等) / slow(慢速)")
-    rhythm_input = Prompt.ask(
-        f"  叙事节奏 [当前: {current_rhythm}]",
-        default="",
-    )
+    rhythm_input = _ask(f"  叙事节奏 [当前: {current_rhythm}]", default="")
     if rhythm_input.strip():
         new_rhythm = rhythm_map.get(rhythm_input.strip(), current_rhythm)
     else:
         new_rhythm = current_rhythm
 
     # 对话占比
-    dialogue_str = Prompt.ask(
-        f"  对话占比（0.0-1.0）[当前: {params['dialogue_ratio']}]",
-        default="",
-    )
+    dialogue_str = _ask(f"  对话占比（0.0-1.0）[当前: {params['dialogue_ratio']}]", default="")
     new_dialogue = float(dialogue_str) if dialogue_str.strip() else params["dialogue_ratio"]
 
     # 描写细腻度
-    detail_str = Prompt.ask(
-        f"  描写细腻度（0.0-1.0）[当前: {params['description_detail']}]",
-        default="",
-    )
+    detail_str = _ask(f"  描写细腻度（0.0-1.0）[当前: {params['description_detail']}]", default="")
     new_detail = float(detail_str) if detail_str.strip() else params["description_detail"]
 
     # 战斗描写风格
-    battle_input = Prompt.ask(
-        f"  战斗描写风格 [当前: {params['battle_style']}]",
-        default="",
-    )
+    battle_input = _ask(f"  战斗描写风格 [当前: {params['battle_style']}]", default="")
     new_battle = battle_input.strip() if battle_input.strip() else params["battle_style"]
 
     # 情感深度
-    emotion_str = Prompt.ask(
-        f"  情感深度（0.0-1.0）[当前: {params['emotional_depth']}]",
-        default="",
-    )
+    emotion_str = _ask(f"  情感深度（0.0-1.0）[当前: {params['emotional_depth']}]", default="")
     new_emotion = float(emotion_str) if emotion_str.strip() else params["emotional_depth"]
 
     # 句式风格
     sentence_choices = {"concise": "简洁", "balanced": "平衡", "elaborate": "细腻"}
     current_sentence = params["sentence_style"]
     console.print("  可选: concise(简洁) / balanced(平衡) / elaborate(细腻)")
-    sentence_input = Prompt.ask(
-        f"  句式风格 [当前: {current_sentence}]",
-        default="",
-    )
+    sentence_input = _ask(f"  句式风格 [当前: {current_sentence}]", default="")
     if sentence_input.strip():
         new_sentence = sentence_choices.get(sentence_input.strip(), current_sentence)
     else:
@@ -868,8 +939,8 @@ def _customize_style(ctx: AppContext, style_name: str) -> str:
     ))
 
     # Ask to save.
-    if Confirm.ask("是否保存此自定义风格供以后使用？(y/n)", default=True):
-        custom_name = Prompt.ask("请输入自定义风格名称")
+    if _confirm("是否保存此自定义风格供以后使用？(y/n)", default=True):
+        custom_name = _ask("请输入自定义风格名称")
         try:
             style_params = ctx.style_manager.create_custom_style(
                 name=custom_name,
@@ -1156,6 +1227,7 @@ def _write_volume(
     novel_name: str,
     volume_num: int,
     words_per_chapter: int = 3000,
+    auto_audit: bool = False,
 ) -> None:
     """Common volume writing logic shared by ``new``, ``write``, and ``continue``.
 
@@ -1168,6 +1240,7 @@ def _write_volume(
     # Ensure volume outline exists.
     vol_outline = ctx.novel_store.load_volume_outline(novel_name, volume_num)
     if not vol_outline:
+        ctx.token_tracker.set_category("outline")
         console.print(
             f"[yellow]第{volume_num}卷大纲不存在，正在生成...[/yellow]"
         )
@@ -1183,12 +1256,15 @@ def _write_volume(
 
     volume_writer = ctx.make_volume_writer(novel_name)
 
+    ctx.token_tracker.set_category("generation")
     console.print()
     try:
         result = volume_writer.write_volume(
             novel_name=novel_name,
             volume_num=volume_num,
-            target_words_per_chapter=words_per_chapter,
+            words_per_chapter=words_per_chapter,
+            batch_size=ctx.batch_size,
+            generation_mode=ctx.generation_mode,
         )
     except Exception as exc:
         console.print(f"[red]生成第{volume_num}卷失败: {exc}[/red]")
@@ -1217,6 +1293,15 @@ def _write_volume(
             f"{ch['word_count']:,}",
         )
     console.print(ch_table)
+
+    # Auto-audit if requested.
+    if auto_audit:
+        console.print()
+        console.print("[cyan]自动审计中...[/cyan]")
+        audit_args = argparse.Namespace(
+            novel=novel_name, volume=volume_num, fix=None
+        )
+        cmd_audit(ctx, audit_args)
 
 
 # ===================================================================
@@ -1350,6 +1435,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--words", type=int, default=None, metavar="N",
         help="每章目标字数，覆盖 config.yaml 中的 words_per_chapter 设置",
     )
+    write_parser.add_argument(
+        "--audit", action="store_true", default=False,
+        help="生成完成后自动进行审计",
+    )
 
     # --- audit ---
     audit_parser = sub.add_parser(
@@ -1443,6 +1532,18 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="示例:\n  python cli.py list",
     )
 
+    # --- token ---
+    token_parser = sub.add_parser(
+        "token",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="查看本次会话的Token使用统计",
+        description=(
+            "显示本次CLI会话中所有LLM调用的Token使用量，\n"
+            "按类别分组（生成、大纲、审计、记忆、摘要）。"
+        ),
+        epilog="示例:\n  python cli.py token",
+    )
+
     return parser
 
 
@@ -1503,6 +1604,7 @@ def main() -> None:
         "audit": lambda: cmd_audit(ctx, args),
         "status": lambda: cmd_status(ctx, args),
         "continue": lambda: cmd_continue(ctx, args),
+        "token": lambda: cmd_token(ctx),
     }
 
     handler = dispatch.get(args.command)
@@ -1513,6 +1615,10 @@ def main() -> None:
 
     try:
         handler()
+        # Show token usage after operations that use LLM.
+        if args.command in ("new", "write", "audit", "continue"):
+            console.print()
+            console.print(ctx.token_tracker.report())
     except KeyboardInterrupt:
         console.print()
         console.print("[yellow]操作已被用户中断。[/yellow]")
