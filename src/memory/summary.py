@@ -70,8 +70,20 @@ class SummaryGenerator:
             {"role": "user", "content": prompt},
         ]
 
-        response = llm_client.chat(messages, temperature=0.4)
-        summary = self._parse_summary_response(response)
+        # Retry on empty/malformed LLM responses (up to 3 retries).
+        summary: dict[str, Any] = {}
+        for attempt in range(4):
+            response = llm_client.chat(messages, temperature=0.4)
+            try:
+                summary = self._parse_summary_response(response)
+                break
+            except ValueError:
+                if attempt < 3:
+                    logger.warning("Summary parse failed, retry %d/3", attempt + 1)
+                    messages.append({"role": "assistant", "content": response})
+                    messages.append({"role": "user", "content": "请重新输出JSON格式的卷小结，确保是有效JSON。"})
+                else:
+                    raise
 
         # Ensure required top-level fields are present.
         summary.setdefault("volume", volume_num)

@@ -12,6 +12,7 @@ from typing import Any, Generator, Optional
 
 import yaml
 from openai import APIStatusError, APITimeoutError, OpenAI, RateLimitError
+from .token_tracker import TokenTracker
 
 logger = logging.getLogger(__name__)
 
@@ -116,19 +117,25 @@ class LLMClient:
 
     # -- construction -------------------------------------------------------
 
-    def __init__(self, config_path: str = "config.yaml") -> None:
+    def __init__(
+        self,
+        config_path: str = "config.yaml",
+        token_tracker: TokenTracker | None = None,
+    ) -> None:
         """Create a new LLM client.
 
         Args:
             config_path: Path to the YAML configuration file.  Must contain
                 an ``llm`` key with ``api_key``, ``base_url``, ``model``,
                 ``max_tokens``, and ``temperature`` sub-keys.
+            token_tracker: Optional TokenTracker for recording API usage.
 
         Raises:
             LLMError: If the config file is missing / unreadable or if no
                 API key can be found.
         """
         self._config: dict[str, Any] = self._load_config(config_path)
+        self._tracker = token_tracker
 
         # Resolve credentials & endpoint — env vars take precedence.
         self._api_key: str = os.getenv(
@@ -271,6 +278,15 @@ class LLMClient:
         """The API endpoint base URL."""
         return self._base_url
 
+    @property
+    def token_tracker(self) -> TokenTracker | None:
+        """The token tracker, if configured."""
+        return self._tracker
+
+    @token_tracker.setter
+    def token_tracker(self, tracker: TokenTracker) -> None:
+        self._tracker = tracker
+
     def chat(
         self,
         messages: list[dict[str, str]],
@@ -317,6 +333,14 @@ class LLMClient:
                 stream=False,
             )
             content: Optional[str] = response.choices[0].message.content
+
+            # Track token usage from API response.
+            if self._tracker and hasattr(response, "usage") and response.usage:
+                self._tracker.record_auto(
+                    input_tokens=response.usage.prompt_tokens or 0,
+                    output_tokens=response.usage.completion_tokens or 0,
+                )
+
             return content or ""
 
         return self._retry_call(_call)

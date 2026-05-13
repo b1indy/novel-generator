@@ -97,13 +97,13 @@ class VolumeWriter:
         novel_store: NovelStore,
         table_store: TableStore,
         summary_generator: SummaryGenerator | None = None,
+        round_size: int = 15,
     ) -> None:
         """Initialise the volume writer with all required dependencies.
 
         Args:
             llm_client: LLM client for token counting and supplementary calls.
-            chapter_writer: Configured ChapterWriter for single-chapter
-                generation.
+            chapter_writer: Configured ChapterWriter for chapter generation.
             character_manager: Character state tracker.
             item_manager: Item state tracker.
             foreshadowing_manager: Foreshadowing state tracker.
@@ -111,7 +111,7 @@ class VolumeWriter:
             novel_store: NovelStore for persisting chapters and outlines.
             table_store: TableStore for persisting volume summaries.
             summary_generator: Optional pre-configured SummaryGenerator.
-                If ``None``, one will be created from *llm_client*.
+            round_size: Chapters per round in continuous mode. Default 15.
         """
         self._llm = llm_client
         self._chapter_writer = chapter_writer
@@ -122,6 +122,7 @@ class VolumeWriter:
         self._novel_store = novel_store
         self._table_store = table_store
         self._summary_generator = summary_generator or SummaryGenerator(llm_client)
+        self._round_size = round_size
 
         self._console = Console() if _HAS_RICH else None
 
@@ -134,37 +135,24 @@ class VolumeWriter:
         novel_name: str,
         volume_num: int,
         words_per_chapter: int = 5000,
+        batch_size: int = 3,
+        generation_mode: str = "continuous",
     ) -> dict[str, Any]:
-        """Orchestrate writing an entire volume, chapter by chapter.
-
-        Flow:
-        1. Load context from :meth:`OutlineManager.get_context_for_volume`.
-        2. Load the volume outline.
-        3. Loop through each chapter plan item:
-           a. Build context (previous chapters, memory).
-           b. Call :meth:`ChapterWriter.write_chapter`.
-           c. Save the chapter via :meth:`NovelStore.save_chapter`.
-           d. Update memory via
-              :meth:`ChapterWriter.update_memory_after_chapter`.
-           e. Track word count and report progress.
-        4. After all chapters:
-           a. Generate a volume summary via :class:`SummaryGenerator`.
-           b. Persist the summary.
-        5. Return volume result dict.
+        """Orchestrate writing an entire volume.
 
         Args:
             novel_name: Directory-safe novel identifier.
             volume_num: Volume number to write (1-indexed).
-            words_per_chapter: Target Chinese characters per
-                chapter. Default 5000.
+            words_per_chapter: Target Chinese characters per chapter.
+            batch_size: Chapters per LLM call (used in "batch" mode).
+            generation_mode: Generation strategy:
+                - "single": one chapter per LLM call (original)
+                - "batch": batch_size chapters per LLM call
+                - "continuous": multi-turn "继续" for max coherence (default)
 
         Returns:
             Dict with keys: ``volume``, ``title``, ``chapter_count``,
-            ``total_words``, ``chapters`` (list of dicts with
-            ``chapter_num``, ``title``, ``word_count``).
-
-        Raises:
-            FileNotFoundError: If the volume outline does not exist.
+            ``total_words``, ``chapters``.
         """
         # -- Step 1: assemble context --
         context = self._outline_manager.get_context_for_volume(novel_name, volume_num)
@@ -180,101 +168,50 @@ class VolumeWriter:
 
         chapter_plan: list[dict[str, Any]] = volume_outline.get("chapter_plan", [])
         if not chapter_plan:
-            raise ValueError(
-                f"Volume {volume_num} outline has an empty chapter_plan"
-            )
+            raise ValueError(f"Volume {volume_num} outline has an empty chapter_plan")
 
         volume_title = volume_outline.get("volume_title", f"第{volume_num}卷")
+        novel_title_str = total_outline.get("_meta", {}).get("title", novel_name)
 
-        # Prepare previous-volume context for the first chapter.
         prev_chapters = context.get("last_chapters", [])
         self._info(
             f"开始生成 第{volume_num}卷「{volume_title}」"
-            f"（共{len(chapter_plan)}章，每章目标{words_per_chapter}字）"
+            f"（共{len(chapter_plan)}章，每章目标{words_per_chapter}字，模式={generation_mode}）"
         )
 
-        # -- Step 3: chapter loop --
+        # -- Step 3: generate chapters based on mode --
         written_chapters: list[dict[str, Any]] = []
         recent_texts: list[str] = []
-
-        # Seed recent_texts with the last chapters from the previous volume.
         for ch in prev_chapters:
             content = ch.get("content", "")
             if content:
                 recent_texts.append(content)
-        # Keep only the last 2 for continuity.
         recent_texts = recent_texts[-2:]
 
         total_words_estimate = 0
-        chapter_count = len(chapter_plan)
 
-        iterator = self._progress_wrapper(chapter_plan, volume_title)
-
-        for idx, chapter_plan_item in enumerate(iterator):
-            ch_num = chapter_plan_item.get("chapter_num", idx + 1)
-
-            # Build previous context string from recent chapters.
-            prev_context = self._build_chapter_prompt(
+        if generation_mode == "continuous":
+            written_chapters, total_words_estimate = self._write_continuous(
+                novel_name=novel_name,
+                volume_num=volume_num,
+                chapter_plan=chapter_plan,
+                volume_outline=volume_outline,
+                total_outline=total_outline,
                 recent_texts=recent_texts,
-                chapter_plan_item=chapter_plan_item,
+                words_per_chapter=words_per_chapter,
+                round_size=self._round_size,
             )
-
-            # Check token budget if context is accumulating.
-            if prev_context:
-                self._check_context_size(prev_context)
-
-            self._info(f"  正在生成 vol_{volume_num:03d}/ch_{ch_num:03d} ...")
-
-            # Generate the chapter.
-            try:
-                result = self._chapter_writer.write_chapter(
-                    novel_title=total_outline.get("_meta", {}).get("title", novel_name),
-                    volume_num=volume_num,
-                    chapter_num=ch_num,
-                    volume_outline=volume_outline,
-                    chapter_plan_item=chapter_plan_item,
-                    total_outline=total_outline,
-                    prev_context=prev_context,
-                    target_words=words_per_chapter,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to generate vol_%03d/ch_%03d", volume_num, ch_num
-                )
-                raise
-
-            title = result.get("title", f"第{ch_num}章")
-            content = result.get("content", "")
-
-            # Estimate word count (Chinese characters in body text).
-            word_count = self._count_chinese_chars(content)
-
-            # Save the chapter.
-            self._novel_store.save_chapter(
-                novel_name, volume_num, ch_num, content, title
-            )
-
-            # Update memory tables.
-            self._chapter_writer.update_memory_after_chapter(
-                content, volume_num, ch_num
-            )
-
-            # Track.
-            total_words_estimate += word_count
-            written_chapters.append({
-                "chapter_num": ch_num,
-                "title": title,
-                "word_count": word_count,
-            })
-
-            # Update recent texts sliding window.
-            recent_texts.append(content)
-            if len(recent_texts) > 2:
-                recent_texts = recent_texts[-2:]
-
-            self._info(
-                f"  vol_{volume_num:03d}/ch_{ch_num:03d} 「{title}」"
-                f" 完成（~{word_count}字）"
+        else:
+            bs = 1 if generation_mode == "single" else batch_size
+            written_chapters, total_words_estimate = self._write_batched(
+                novel_name=novel_name,
+                volume_num=volume_num,
+                chapter_plan=chapter_plan,
+                volume_outline=volume_outline,
+                total_outline=total_outline,
+                recent_texts=recent_texts,
+                words_per_chapter=words_per_chapter,
+                batch_size=bs,
             )
 
         # -- Step 4: generate volume summary --
@@ -302,6 +239,220 @@ class VolumeWriter:
         )
 
         return volume_result
+
+    # ------------------------------------------------------------------
+    # Generation strategies
+    # ------------------------------------------------------------------
+
+    def _write_continuous(
+        self,
+        novel_name: str,
+        volume_num: int,
+        chapter_plan: list[dict[str, Any]],
+        volume_outline: dict[str, Any],
+        total_outline: dict[str, Any],
+        recent_texts: list[str],
+        words_per_chapter: int,
+        round_size: int = 15,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Generate chapters using multi-turn continuous mode.
+
+        Splits chapter_plan into rounds. Each round uses the "继续" pattern
+        for intra-round coherence. Memory tables are updated after each round.
+
+        Returns:
+            (written_chapters, total_words_estimate)
+        """
+        rounds: list[list[dict[str, Any]]] = []
+        for i in range(0, len(chapter_plan), round_size):
+            rounds.append(chapter_plan[i : i + round_size])
+
+        novel_title_str = total_outline.get("_meta", {}).get("title", novel_name)
+        written_chapters: list[dict[str, Any]] = []
+        total_words_estimate = 0
+        current_recent = list(recent_texts)
+
+        for round_idx, round_plans in enumerate(rounds):
+            round_first = round_plans[0].get("chapter_num", 1)
+            round_last = round_plans[-1].get("chapter_num", len(round_plans))
+
+            # Build previous context.
+            prev_context = ""
+            if current_recent:
+                prev_context = "\n\n---\n\n".join(current_recent[-2:])
+
+            self._info(
+                f"  连续生成 第{round_idx + 1}/{len(rounds)}轮: "
+                f"ch_{round_first:03d}-ch_{round_last:03d}（{len(round_plans)}章）..."
+            )
+
+            try:
+                results = self._chapter_writer.write_chapters_continuous(
+                    novel_title=novel_title_str,
+                    volume_num=volume_num,
+                    chapter_plans=round_plans,
+                    volume_outline=volume_outline,
+                    total_outline=total_outline,
+                    prev_context=prev_context,
+                    target_words=words_per_chapter,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed continuous generation round %d for vol_%03d",
+                    round_idx + 1, volume_num,
+                )
+                raise
+
+            # Save chapters and update memory after each round.
+            for i, result in enumerate(results):
+                ch_plan = round_plans[i] if i < len(round_plans) else round_plans[-1]
+                ch_num = ch_plan.get("chapter_num", round_first + i)
+                title = result.get("title", f"第{ch_num}章")
+                content = result.get("content", "")
+
+                word_count = self._count_chinese_chars(content)
+
+                self._novel_store.save_chapter(
+                    novel_name, volume_num, ch_num, content, title
+                )
+
+                total_words_estimate += word_count
+                written_chapters.append({
+                    "chapter_num": ch_num,
+                    "title": title,
+                    "word_count": word_count,
+                })
+
+                current_recent.append(content)
+                if len(current_recent) > 2:
+                    current_recent = current_recent[-2:]
+
+                self._info(
+                    f"  vol_{volume_num:03d}/ch_{ch_num:03d} 「{title}」"
+                    f" 完成（~{word_count}字）"
+                )
+
+            # Update memory tables after each round.
+            self._info(f"  第{round_idx + 1}轮完成，更新记忆表...")
+            for result in results:
+                content = result.get("content", "")
+                if content:
+                    try:
+                        self._chapter_writer.update_memory_after_chapter(
+                            content, volume_num, 0  # chapter_num not critical for extraction
+                        )
+                    except Exception:
+                        logger.exception("Memory update failed for round %d", round_idx + 1)
+
+        return written_chapters, total_words_estimate
+
+    def _write_batched(
+        self,
+        novel_name: str,
+        volume_num: int,
+        chapter_plan: list[dict[str, Any]],
+        volume_outline: dict[str, Any],
+        total_outline: dict[str, Any],
+        recent_texts: list[str],
+        words_per_chapter: int,
+        batch_size: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Generate chapters using batch mode (batch_size chapters per LLM call).
+
+        Returns:
+            (written_chapters, total_words_estimate)
+        """
+        novel_title_str = total_outline.get("_meta", {}).get("title", novel_name)
+        written_chapters: list[dict[str, Any]] = []
+        total_words_estimate = 0
+        current_recent = list(recent_texts)
+
+        # Group into batches.
+        batches: list[list[dict[str, Any]]] = []
+        for i in range(0, len(chapter_plan), batch_size):
+            batches.append(chapter_plan[i : i + batch_size])
+
+        for batch_idx, batch in enumerate(batches):
+            batch_first = batch[0].get("chapter_num", 1)
+            batch_last = batch[-1].get("chapter_num", len(batch))
+
+            prev_context = ""
+            if current_recent:
+                prev_context = "\n\n---\n\n".join(current_recent[-2:])
+
+            if batch_size == 1:
+                ch_num = batch_first
+                self._info(f"  正在生成 vol_{volume_num:03d}/ch_{ch_num:03d} ...")
+                try:
+                    result = self._chapter_writer.write_chapter(
+                        novel_title=novel_title_str,
+                        volume_num=volume_num,
+                        chapter_num=ch_num,
+                        volume_outline=volume_outline,
+                        chapter_plan_item=batch[0],
+                        total_outline=total_outline,
+                        prev_context=prev_context,
+                        target_words=words_per_chapter,
+                    )
+                except Exception:
+                    logger.exception("Failed to generate vol_%03d/ch_%03d", volume_num, ch_num)
+                    raise
+                results = [result]
+            else:
+                self._info(
+                    f"  正在批量生成 vol_{volume_num:03d}/ch_{batch_first:03d}"
+                    f"-ch_{batch_last:03d}（{len(batch)}章）..."
+                )
+                try:
+                    results = self._chapter_writer.write_chapters_batch(
+                        novel_title=novel_title_str,
+                        volume_num=volume_num,
+                        chapter_plans=batch,
+                        volume_outline=volume_outline,
+                        total_outline=total_outline,
+                        prev_context=prev_context,
+                        target_words=words_per_chapter,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to generate batch vol_%03d/ch_%03d-ch_%03d",
+                        volume_num, batch_first, batch_last,
+                    )
+                    raise
+
+            # Process results.
+            for i, result in enumerate(results):
+                ch_plan = batch[i] if i < len(batch) else batch[-1]
+                ch_num = ch_plan.get("chapter_num", batch_first + i)
+                title = result.get("title", f"第{ch_num}章")
+                content = result.get("content", "")
+
+                word_count = self._count_chinese_chars(content)
+
+                self._novel_store.save_chapter(
+                    novel_name, volume_num, ch_num, content, title
+                )
+                self._chapter_writer.update_memory_after_chapter(
+                    content, volume_num, ch_num
+                )
+
+                total_words_estimate += word_count
+                written_chapters.append({
+                    "chapter_num": ch_num,
+                    "title": title,
+                    "word_count": word_count,
+                })
+
+                current_recent.append(content)
+                if len(current_recent) > 2:
+                    current_recent = current_recent[-2:]
+
+                self._info(
+                    f"  vol_{volume_num:03d}/ch_{ch_num:03d} 「{title}」"
+                    f" 完成（~{word_count}字）"
+                )
+
+        return written_chapters, total_words_estimate
 
     # ------------------------------------------------------------------
     # Prompt building

@@ -336,15 +336,35 @@ class ChapterWriter:
 
         # -- Previous chapter continuity --
         if prev_context.strip():
-            # Truncate if extremely long to control prompt size.
+            # Use more context for cross-volume transitions (first chapter
+            # of a new volume needs richer continuity from the previous volume).
+            limit = 8000 if chapter_num == 1 else 4000
             safe_prev = prev_context
-            if len(safe_prev) > 4000:
-                safe_prev = safe_prev[-4000:]
+            if len(safe_prev) > limit:
+                safe_prev = safe_prev[-limit:]
                 logger.debug(
                     "Truncated prev_context from %d to %d chars for prompt size",
-                    len(prev_context), 4000,
+                    len(prev_context), limit,
                 )
-            blocks.append(f"【上文衔接（已有章节内容，请保持连贯）】\n{safe_prev}")
+
+            # For the first chapter of a new volume, add explicit transition
+            # instructions to prevent plot thread dropping.
+            if chapter_num == 1 and volume_num > 1:
+                transition_note = (
+                    "注意：这是新一卷的开篇。上文是前一卷的结尾章节。"
+                    "你必须：\n"
+                    "1. 自然延续前卷结尾的剧情状态和氛围\n"
+                    "2. 保留前卷末尾埋下的所有伏笔和悬念\n"
+                    "3. 角色状态、关系、位置需与前卷结尾一致\n"
+                    "4. 不要重新引入已在前卷建立的设定\n"
+                    "5. 可以有时间推进，但需明确交代过渡"
+                )
+                blocks.append(
+                    f"【前卷结尾衔接（关键：这是跨卷过渡）】\n{safe_prev}\n\n"
+                    f"【跨卷衔接要求】\n{transition_note}"
+                )
+            else:
+                blocks.append(f"【上文衔接（已有章节内容，请保持连贯）】\n{safe_prev}")
         else:
             blocks.append("【上文衔接】这是本小说/本卷的第一章，无上文内容。请正常开篇。")
 
@@ -499,6 +519,529 @@ class ChapterWriter:
             volume_num, chapter_num, title,
         )
         return {"title": title, "content": f"## {title}\n\n{text}"}
+
+    # ------------------------------------------------------------------
+    # Continuous generation (multi-turn "继续" approach)
+    # ------------------------------------------------------------------
+
+    def write_chapters_continuous(
+        self,
+        novel_title: str,
+        volume_num: int,
+        chapter_plans: list[dict[str, Any]],
+        volume_outline: dict[str, Any],
+        total_outline: dict[str, Any],
+        prev_context: str = "",
+        target_words: int = 3000,
+        max_continues: int = 10,
+    ) -> list[dict[str, str]]:
+        """Generate chapters in a multi-turn conversation for maximum coherence.
+
+        Uses the "继续" pattern: starts a conversation with full context,
+        asks the LLM to generate multiple chapters, and sends "继续" when
+        the output is truncated, keeping the full conversation context.
+
+        Args:
+            novel_title: Display title of the novel.
+            volume_num: Volume number (1-indexed).
+            chapter_plans: List of chapter plan items to generate.
+            volume_outline: The full volume outline dict.
+            total_outline: The complete total outline dict.
+            prev_context: Full text of the previous 1-2 chapters.
+            target_words: Approximate target word count per chapter.
+            max_continues: Maximum number of "继续" rounds. Default 10.
+
+        Returns:
+            List of dicts with ``title`` and ``content`` keys.
+        """
+        if not chapter_plans:
+            return []
+
+        meta = total_outline.get("_meta", {})
+        style_name = meta.get("style_name", "")
+        genre = meta.get("genre", "")
+
+        # Build the initial system + user prompt.
+        system_msg = self._build_continuous_system_prompt(
+            style_name, genre, chapter_plans, target_words
+        )
+        user_msg = self._build_continuous_user_prompt(
+            novel_title=novel_title,
+            volume_num=volume_num,
+            chapter_plans=chapter_plans,
+            total_outline=total_outline,
+            volume_outline=volume_outline,
+            prev_context=prev_context,
+            target_words=target_words,
+        )
+
+        # Multi-turn conversation loop.
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+
+        all_response_parts: list[str] = []
+        continue_count = 0
+
+        logger.info(
+            "Starting continuous generation for vol_%03d: %d chapters planned",
+            volume_num, len(chapter_plans),
+        )
+
+        while continue_count <= max_continues:
+            # Use higher max_tokens for continuous generation.
+            max_tok = min(16384, self._max_tokens * 2)
+
+            response = self._llm.chat(
+                messages,
+                temperature=self._temperature,
+                max_tokens=max_tok,
+            )
+
+            all_response_parts.append(response)
+            messages.append({"role": "assistant", "content": response})
+
+            # Check if we have all expected chapters.
+            combined = "\n\n".join(all_response_parts)
+            found_chapters = len(re.findall(r"##\s*第[一二三四五六七八九十百千\d]+章", combined))
+
+            logger.info(
+                "Continuous round %d: got %d chapters so far (target %d)",
+                continue_count + 1, found_chapters, len(chapter_plans),
+            )
+
+            if found_chapters >= len(chapter_plans):
+                break  # All chapters generated.
+
+            # Check if response was truncated (ended mid-sentence).
+            last_char = response.strip()[-1] if response.strip() else ""
+            seems_truncated = last_char not in ("。", "！", "？", "」", "』", "…", '"', "'")
+
+            if not seems_truncated and found_chapters < len(chapter_plans):
+                # Response ended naturally but not all chapters done.
+                # Ask for remaining chapters explicitly.
+                remaining = len(chapter_plans) - found_chapters
+                next_ch = chapter_plans[found_chapters].get("chapter_num", found_chapters + 1)
+                messages.append({
+                    "role": "user",
+                    "content": f"请继续生成第{next_ch}章及后续{remaining - 1}章。",
+                })
+            else:
+                # Truncated mid-generation, send "继续".
+                messages.append({"role": "user", "content": "继续"})
+
+            continue_count += 1
+
+        # Parse all generated chapters.
+        combined = "\n\n".join(all_response_parts)
+        return self._parse_continuous_response(combined, volume_num, chapter_plans)
+
+    def _build_continuous_system_prompt(
+        self,
+        style_name: str,
+        genre: str,
+        chapter_plans: list[dict[str, Any]],
+        target_words: int,
+    ) -> str:
+        """Build system prompt for continuous generation."""
+        first_ch = chapter_plans[0].get("chapter_num", 1)
+        last_ch = chapter_plans[-1].get("chapter_num", len(chapter_plans))
+
+        parts: list[str] = [
+            f"你是一位专业的中国网络小说作家。你的任务是连续创作第{first_ch}章到第{last_ch}章"
+            f"（共{len(chapter_plans)}章），每章约{target_words}字。\n\n"
+            f"写作要求：\n"
+            f"1. 严格按照提供的写作风格和流派设定进行创作\n"
+            f"2. 确保内容与总大纲、卷大纲的剧情方向一致\n"
+            f"3. 角色行为需与角色设定表一致\n"
+            f"4. 注意伏笔的铺设和已有伏笔的回收\n"
+            f"5. 每章要有起承转合，结尾留有悬念\n"
+            f"6. 对话自然，描写生动，避免模板化表达\n"
+            f"7. 章节之间自然过渡，不要重复上一章结尾\n\n"
+            f"输出格式：\n"
+            f"- 每章以 ## 第X章 标题 开头\n"
+            f"- 空一行后开始章节正文\n"
+            f"- 一章结束后直接开始下一章（不要加分隔符）\n"
+            f"- 如果输出被截断，下次从截断处继续\n"
+            f"- 正文为纯中文小说内容"
+        ]
+
+        if genre:
+            try:
+                parts.append("\n" + self._style.get_genre_prompt(genre))
+            except KeyError:
+                pass
+
+        if style_name:
+            try:
+                parts.append("\n" + self._style.get_style_prompt(style_name))
+            except KeyError:
+                pass
+
+        return "\n".join(parts)
+
+    def _build_continuous_user_prompt(
+        self,
+        novel_title: str,
+        volume_num: int,
+        chapter_plans: list[dict[str, Any]],
+        total_outline: dict[str, Any],
+        volume_outline: dict[str, Any],
+        prev_context: str,
+        target_words: int,
+    ) -> str:
+        """Build user prompt for continuous generation."""
+        blocks: list[str] = []
+
+        volume_title = volume_outline.get("volume_title", f"第{volume_num}卷")
+        first_ch = chapter_plans[0].get("chapter_num", 1)
+        last_ch = chapter_plans[-1].get("chapter_num", len(chapter_plans))
+
+        blocks.append(
+            f"请为小说《{novel_title}》连续创作第{volume_num}卷「{volume_title}」"
+            f"的第{first_ch}章至第{last_ch}章。\n"
+            f"每章目标字数：约{target_words}字。\n"
+        )
+
+        # Total outline summary.
+        total_summary = self._format_total_outline_summary(total_outline)
+        blocks.append(f"【总大纲摘要】\n{total_summary}")
+
+        # Volume outline summary.
+        volume_summary = self._format_volume_outline_summary(volume_outline)
+        blocks.append(f"【卷大纲信息】\n{volume_summary}")
+
+        # Chapter plans for this round.
+        plan_lines: list[str] = []
+        for cp in chapter_plans:
+            ch_num = cp.get("chapter_num", "?")
+            title_hint = cp.get("title_hint", "")
+            key_events = cp.get("key_events", [])
+            char_focus = cp.get("character_focus", "")
+
+            plan_lines.append(f"第{ch_num}章：{title_hint}")
+            if key_events:
+                for evt in key_events:
+                    plan_lines.append(f"  - {evt}")
+            if char_focus:
+                plan_lines.append(f"  角色焦点: {char_focus}")
+        blocks.append(f"【本批次章节计划】\n" + "\n".join(plan_lines))
+
+        # Memory context.
+        memory_context = self._format_memory_context()
+        blocks.append(f"【当前状态表】\n{memory_context}")
+
+        # Previous chapter continuity.
+        if prev_context.strip():
+            limit = 8000 if first_ch == 1 and volume_num > 1 else 4000
+            safe_prev = prev_context
+            if len(safe_prev) > limit:
+                safe_prev = safe_prev[-limit:]
+
+            if first_ch == 1 and volume_num > 1:
+                blocks.append(
+                    f"【前卷结尾衔接】\n{safe_prev}\n\n"
+                    f"【跨卷衔接要求】\n"
+                    f"这是新一卷的开篇。必须自然延续前卷结尾的剧情，保留所有伏笔。"
+                )
+            else:
+                blocks.append(f"【上文衔接】\n{safe_prev}")
+        else:
+            blocks.append("【上文衔接】这是本小说/本卷的开篇，无上文内容。")
+
+        blocks.append(
+            f"请从第{first_ch}章开始，连续输出{len(chapter_plans)}章完整内容。"
+            f"每章以 ## 第X章 标题 开头，一章结束后直接开始下一章。"
+        )
+
+        return "\n\n".join(blocks)
+
+    @staticmethod
+    def _parse_continuous_response(
+        response: str,
+        volume_num: int,
+        chapter_plans: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        """Parse a continuous generation response into individual chapters.
+
+        Splits on ``## 第X章`` markers.
+        """
+        text = response.strip()
+
+        # Split on chapter headers.
+        pattern = re.compile(r"(?=##\s*第[一二三四五六七八九十百千\d]+章)")
+        blocks = pattern.split(text)
+        blocks = [b.strip() for b in blocks if b.strip()]
+
+        results: list[dict[str, str]] = []
+        title_pattern = re.compile(r"^##\s*(第[一二三四五六七八九十百千\d]+章\s*\S.*)")
+
+        for i, block in enumerate(blocks):
+            match = title_pattern.match(block)
+            if match:
+                title = match.group(1).strip()
+                body = block[match.end():].lstrip("\n")
+                full_content = f"## {title}\n\n{body}"
+            else:
+                ch_num = chapter_plans[i].get("chapter_num", i + 1) if i < len(chapter_plans) else i + 1
+                title = f"第{ch_num}章"
+                full_content = f"## {title}\n\n{block}"
+                logger.warning("No title in continuous block %d, using fallback", i)
+
+            results.append({"title": title, "content": full_content})
+
+        if len(results) < len(chapter_plans):
+            logger.warning(
+                "Continuous response has %d chapters but expected %d",
+                len(results), len(chapter_plans),
+            )
+
+        return results
+
+    def write_chapters_batch(
+        self,
+        novel_title: str,
+        volume_num: int,
+        chapter_plans: list[dict[str, Any]],
+        volume_outline: dict[str, Any],
+        total_outline: dict[str, Any],
+        prev_context: str = "",
+        target_words: int = 3000,
+    ) -> list[dict[str, str]]:
+        """Generate multiple chapters in a single LLM call for better coherence.
+
+        Args:
+            novel_title: Display title of the novel.
+            volume_num: Volume number (1-indexed).
+            chapter_plans: List of chapter plan items to generate.
+            volume_outline: The full volume outline dict.
+            total_outline: The complete total outline dict.
+            prev_context: Full text of the previous 1-2 chapters.
+            target_words: Approximate target word count per chapter.
+
+        Returns:
+            List of dicts with ``title`` and ``content`` keys, one per chapter.
+        """
+        if not chapter_plans:
+            return []
+
+        if len(chapter_plans) == 1:
+            # Single chapter - use the regular method.
+            result = self.write_chapter(
+                novel_title=novel_title,
+                volume_num=volume_num,
+                chapter_num=chapter_plans[0].get("chapter_num", 1),
+                volume_outline=volume_outline,
+                chapter_plan_item=chapter_plans[0],
+                total_outline=total_outline,
+                prev_context=prev_context,
+                target_words=target_words,
+            )
+            return [result]
+
+        # Build batch prompt.
+        meta = total_outline.get("_meta", {})
+        style_name = meta.get("style_name", "")
+        genre = meta.get("genre", "")
+
+        system_msg = self._build_batch_system_prompt(style_name, genre, len(chapter_plans))
+        user_msg = self._build_batch_user_prompt(
+            novel_title=novel_title,
+            volume_num=volume_num,
+            chapter_plans=chapter_plans,
+            total_outline=total_outline,
+            volume_outline=volume_outline,
+            prev_context=prev_context,
+            target_words=target_words,
+        )
+
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+
+        # Use higher max_tokens for batch generation.
+        batch_max_tokens = self._max_tokens * len(chapter_plans)
+        batch_max_tokens = min(batch_max_tokens, 65536)  # Cap at 64K tokens.
+
+        prompt_text = system_msg + "\n" + user_msg
+        est_tokens = self._llm.count_tokens(prompt_text)
+        logger.info(
+            "Generating batch of %d chapters for vol_%03d: prompt ~%d tokens",
+            len(chapter_plans), volume_num, est_tokens,
+        )
+
+        response = self._llm.chat(
+            messages,
+            temperature=self._temperature,
+            max_tokens=batch_max_tokens,
+        )
+
+        return self._parse_batch_response(response, volume_num, chapter_plans)
+
+    def _build_batch_system_prompt(
+        self, style_name: str, genre: str, batch_size: int
+    ) -> str:
+        """Build system prompt for batch chapter generation."""
+        parts: list[str] = [
+            f"你是一位专业的中国网络小说作家。你的任务是根据给定的大纲、角色设定、"
+            f"记忆表和上下文，连续创作{batch_size}章小说章节。\n\n"
+            f"写作要求：\n"
+            f"1. 严格按照提供的写作风格和流派设定进行创作\n"
+            f"2. 确保内容与总大纲、卷大纲的剧情方向一致\n"
+            f"3. 角色行为需与角色设定表一致，不产生性格或状态矛盾\n"
+            f"4. 注意伏笔的铺设和已有伏笔的回收\n"
+            f"5. 每章内容要有起承转合，结尾留有悬念\n"
+            f"6. 对话自然，描写生动，避免模板化表达\n"
+            f"7. 每章开头不要重复上一章的结尾内容，应直接推进剧情\n"
+            f"8. 章节之间要有自然的过渡和连贯性\n\n"
+            f"输出格式：\n"
+            f"- 每章以 ## 第X章 标题 开头\n"
+            f"- 空一行后开始章节正文\n"
+            f"- 章节之间用 --- 分隔\n"
+            f"- 正文为纯中文小说内容，不需要任何其他标记"
+        ]
+
+        if genre:
+            try:
+                parts.append("\n" + self._style.get_genre_prompt(genre))
+            except KeyError:
+                pass
+
+        if style_name:
+            try:
+                parts.append("\n" + self._style.get_style_prompt(style_name))
+            except KeyError:
+                pass
+
+        return "\n".join(parts)
+
+    def _build_batch_user_prompt(
+        self,
+        novel_title: str,
+        volume_num: int,
+        chapter_plans: list[dict[str, Any]],
+        total_outline: dict[str, Any],
+        volume_outline: dict[str, Any],
+        prev_context: str,
+        target_words: int,
+    ) -> str:
+        """Build user prompt for batch chapter generation."""
+        blocks: list[str] = []
+
+        volume_title = volume_outline.get("volume_title", f"第{volume_num}卷")
+        first_ch = chapter_plans[0].get("chapter_num", 1)
+        last_ch = chapter_plans[-1].get("chapter_num", len(chapter_plans))
+
+        blocks.append(
+            f"请为小说《{novel_title}》创作第{volume_num}卷「{volume_title}」"
+            f"的第{first_ch}章至第{last_ch}章（共{len(chapter_plans)}章）。\n"
+            f"每章目标字数：约{target_words}字。\n"
+        )
+
+        # Total outline summary.
+        total_summary = self._format_total_outline_summary(total_outline)
+        blocks.append(f"【总大纲摘要】\n{total_summary}")
+
+        # Volume outline summary.
+        volume_summary = self._format_volume_outline_summary(volume_outline)
+        blocks.append(f"【卷大纲信息】\n{volume_summary}")
+
+        # Chapter plans for the batch.
+        plan_lines: list[str] = []
+        for cp in chapter_plans:
+            ch_num = cp.get("chapter_num", "?")
+            title_hint = cp.get("title_hint", "")
+            key_events = cp.get("key_events", [])
+            char_focus = cp.get("character_focus", "")
+
+            plan_lines.append(f"第{ch_num}章：{title_hint}")
+            if key_events:
+                for evt in key_events:
+                    plan_lines.append(f"  - {evt}")
+            if char_focus:
+                plan_lines.append(f"  角色焦点: {char_focus}")
+        blocks.append(f"【本批次章节计划】\n" + "\n".join(plan_lines))
+
+        # Memory context.
+        memory_context = self._format_memory_context()
+        blocks.append(f"【当前状态表】\n{memory_context}")
+
+        # Previous chapter continuity.
+        if prev_context.strip():
+            limit = 8000 if first_ch == 1 and volume_num > 1 else 4000
+            safe_prev = prev_context
+            if len(safe_prev) > limit:
+                safe_prev = safe_prev[-limit:]
+
+            if first_ch == 1 and volume_num > 1:
+                transition_note = (
+                    "注意：这是新一卷的开篇。上文是前一卷的结尾章节。"
+                    "你必须自然延续前卷结尾的剧情状态和氛围，保留所有伏笔和悬念。"
+                )
+                blocks.append(
+                    f"【前卷结尾衔接】\n{safe_prev}\n\n"
+                    f"【跨卷衔接要求】\n{transition_note}"
+                )
+            else:
+                blocks.append(f"【上文衔接】\n{safe_prev}")
+        else:
+            blocks.append("【上文衔接】这是本小说/本卷的开篇，无上文内容。请正常开篇。")
+
+        blocks.append(
+            f"请按照系统提示中的格式，连续输出{len(chapter_plans)}章完整内容。"
+            f"每章之间用 --- 分隔。确保章节之间剧情连贯、节奏自然。"
+        )
+
+        return "\n\n".join(blocks)
+
+    @staticmethod
+    def _parse_batch_response(
+        response: str,
+        volume_num: int,
+        chapter_plans: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        """Parse a batch LLM response into individual chapter dicts.
+
+        Splits on ``---`` separators and extracts ``## 第X章 标题`` from each block.
+        """
+        text = response.strip()
+
+        # Split on --- separator.
+        # Handle various separator formats: ---, ---\n, \n---\n, etc.
+        blocks = re.split(r"\n\s*---\s*\n", text)
+
+        # Clean up blocks.
+        blocks = [b.strip() for b in blocks if b.strip()]
+
+        results: list[dict[str, str]] = []
+        title_pattern = re.compile(r"^##\s*(第[一二三四五六七八九十百千\d]+章\s*\S.*)")
+
+        for i, block in enumerate(blocks):
+            # Try to extract title.
+            match = title_pattern.match(block)
+            if match:
+                title = match.group(1).strip()
+                body = block[match.end():].lstrip("\n")
+                full_content = f"## {title}\n\n{body}"
+            else:
+                # Fallback.
+                ch_num = chapter_plans[i].get("chapter_num", i + 1) if i < len(chapter_plans) else i + 1
+                title = f"第{ch_num}章"
+                full_content = f"## {title}\n\n{block}"
+                logger.warning("No title found in batch block %d, using fallback", i)
+
+            results.append({"title": title, "content": full_content})
+
+        # If we got fewer blocks than expected, log warning.
+        if len(results) < len(chapter_plans):
+            logger.warning(
+                "Batch response has %d blocks but expected %d chapters",
+                len(results), len(chapter_plans),
+            )
+
+        return results
 
     # ------------------------------------------------------------------
     # Memory change application

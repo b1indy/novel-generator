@@ -7,8 +7,10 @@
 ## 特性
 
 - **按卷生成** — 每卷可配置章数（默认 50 章约 25 万字），默认支持百万级上下文窗口，卷内逻辑通畅，跨卷通过小结+末两章衔接
+- **连续生成模式** — 多轮"继续"对话保持上下文贯通，每轮结束后自动更新记忆表，兼顾连贯性与容错
 - **记忆系统** — 角色表、物品表、伏笔表实时追踪，每章生成后自动更新，杜绝剧情 bug
 - **双维度审计** — 单次 LLM 调用同时检查逻辑一致性与 AI 写作痕迹，节省 token
+- **Token 统计** — 实时追踪生成、审计、大纲等各环节的 token 消耗
 - **灵活大纲** — 总大纲 + 卷大纲两级结构，写作中途可优化调整
 - **风格配置** — 内置 5 种作家风格预设 + 6 种小说类型，支持自定义
 - **每章标题 + 导语** — 大纲生成后附带约 100 字导语简介
@@ -55,10 +57,29 @@ python cli.py new
 | `python cli.py outline --novel <名称>` | 查看大纲 |
 | `python cli.py outline --novel <名称> --volume 3` | 生成第 3 卷大纲 |
 | `python cli.py write --novel <名称> --volume 1` | 生成第 1 卷 |
+| `python cli.py write --novel <名称> --volume 1 --audit` | 生成并自动审计 |
 | `python cli.py audit --novel <名称> --volume 1` | 审计第 1 卷 |
 | `python cli.py audit --novel <名称> --volume 1 --fix` | 审计并自动修复 |
 | `python cli.py status --novel <名称>` | 查看进度与状态 |
 | `python cli.py continue --novel <名称>` | 继续生成下一卷 |
+| `python cli.py token` | 查看本次会话 Token 使用统计 |
+
+## 生成模式
+
+在 `config.yaml` 中配置 `generation_mode`：
+
+| 模式 | 说明 | 连贯性 | Token 消耗 |
+|------|------|--------|-----------|
+| `single` | 每章一次 LLM 调用 | 低 | 最低 |
+| `batch` | 每批 N 章一次调用 | 中 | 中等 |
+| `continuous` | 多轮"继续"对话（默认） | **高** | 较高 |
+
+```yaml
+generation:
+  generation_mode: "continuous"  # 推荐
+  round_size: 15                 # continuous 模式每轮章节数
+  batch_size: 3                  # batch 模式每批章节数
+```
 
 ## 内置风格
 
@@ -81,7 +102,7 @@ src/
 ├── llm/          # LLM API 客户端（流式/重试/token计数，支持任意 OpenAI 兼容接口）
 ├── config/       # 风格配置
 ├── outline/      # 大纲生成与管理
-├── generator/    # 小说生成（单章 + 整卷编排）
+├── generator/    # 小说生成（单章 + 批量 + 连续模式）
 ├── auditor/      # 双维度审计Agent
 ├── memory/       # 记忆系统（角色/物品/伏笔/卷小结）
 └── storage/      # 存储层（Markdown + JSON）
@@ -91,7 +112,7 @@ src/
 
 ```
 设定风格 → 生成总大纲 → 生成卷大纲(+导语)
-→ 逐章生成（更新记忆表）→ 整卷审计（逻辑+AI味）
+→ 连续/批量生成（每轮更新记忆表）→ 整卷审计（逻辑+AI味）
 → 生成卷小结 → 下一卷（注入前卷上下文）→ 循环
 ```
 
