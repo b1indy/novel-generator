@@ -597,17 +597,19 @@ def cmd_audit(ctx: AppContext, args: argparse.Namespace) -> None:
     import json
     outline_text = json.dumps(volume_outline, ensure_ascii=False, indent=2)
 
-    # Run audit.
+    # Run audit (batched with overlapping windows for cross-batch continuity).
     ctx.token_tracker.set_category("auditing")
     auditor = ctx.make_auditor()
-    with console.status("[cyan]正在进行审计（LLM调用中）...[/cyan]", spinner="dots"):
+    with console.status("[cyan]正在进行分批交叉审计（LLM调用中）...[/cyan]", spinner="dots"):
         try:
-            report = auditor.audit_volume(
+            report = auditor.audit_volume_batched(
                 novel_name=novel_name,
                 volume_num=volume_num,
                 volume_outline=outline_text,
                 chapters=chapters,
                 memory_tables=memory_tables,
+                batch_size=10,
+                overlap=3,
             )
         except Exception as exc:
             console.print(f"[red]审计失败: {exc}[/red]")
