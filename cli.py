@@ -597,6 +597,21 @@ def cmd_audit(ctx: AppContext, args: argparse.Namespace) -> None:
     import json
     outline_text = json.dumps(volume_outline, ensure_ascii=False, indent=2)
 
+    # Load previous volume's last 2 chapters for cross-volume continuity.
+    prev_volume_chapters = None
+    if volume_num > 1:
+        try:
+            prev_volume_chapters = ctx.novel_store.load_last_n_chapters(
+                novel_name, 2
+            )
+            # Filter to only chapters from volume N-1.
+            prev_volume_chapters = [
+                ch for ch in prev_volume_chapters
+                if ch.get("volume") == volume_num - 1
+            ][:2]
+        except Exception:
+            logger.debug("Could not load previous volume chapters for audit")
+
     # Run audit (batched with overlapping windows for cross-batch continuity).
     ctx.token_tracker.set_category("auditing")
     auditor = ctx.make_auditor()
@@ -610,6 +625,7 @@ def cmd_audit(ctx: AppContext, args: argparse.Namespace) -> None:
                 memory_tables=memory_tables,
                 batch_size=10,
                 overlap=3,
+                prev_volume_chapters=prev_volume_chapters,
             )
         except Exception as exc:
             console.print(f"[red]审计失败: {exc}[/red]")
