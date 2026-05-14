@@ -164,6 +164,124 @@ class Auditor:
 
         return report
 
+    def audit_volume_batched(
+        self,
+        novel_name: str,
+        volume_num: int,
+        volume_outline: str,
+        chapters: list[dict[str, str]],
+        memory_tables: dict[str, Any],
+        batch_size: int = 10,
+        overlap: int = 3,
+    ) -> AuditReport:
+        """Audit a volume in overlapping batches for better cross-batch continuity.
+
+        Each batch covers ``batch_size`` chapters, overlapping ``overlap``
+        chapters with the previous batch. This ensures cross-batch logic
+        consistency is checked.
+
+        Args:
+            novel_name: Human-readable novel title.
+            volume_num: The volume number (1-indexed).
+            volume_outline: The volume-level outline text.
+            chapters: List of chapter dicts.
+            memory_tables: Character/item/foreshadowing tables.
+            batch_size: Chapters per batch (default 10).
+            overlap: Chapters overlapping between batches (default 3).
+
+        Returns:
+            Merged :class:`AuditReport` with deduplicated issues.
+        """
+        total = len(chapters)
+        if total <= batch_size:
+            # Small enough to audit in one call.
+            return self.audit_volume(
+                novel_name, volume_num, volume_outline,
+                chapters, memory_tables,
+            )
+
+        # Generate overlapping batch ranges.
+        batches: list[tuple[int, int]] = []
+        start = 0
+        while start < total:
+            end = min(start + batch_size, total)
+            batches.append((start, end))
+            if end >= total:
+                break
+            start = end - overlap
+
+        logger.info(
+            "Batch audit: %d chapters, %d batches (size=%d, overlap=%d)",
+            total, len(batches), batch_size, overlap,
+        )
+
+        all_logic: list[AuditIssue] = []
+        all_ai_flavor: list[AuditIssue] = []
+        scores: list[float] = []
+        summaries: list[str] = []
+
+        # Track seen issues to deduplicate in overlap zones.
+        seen_descriptions: set[str] = set()
+
+        for batch_idx, (batch_start, batch_end) in enumerate(batches):
+            batch_chapters = chapters[batch_start:batch_end]
+            batch_label = f"ch_{batch_start + 1:03d}-ch_{batch_end:03d}"
+
+            logger.info(
+                "  Batch %d/%d: %s (%d chapters)",
+                batch_idx + 1, len(batches), batch_label, len(batch_chapters),
+            )
+
+            try:
+                batch_report = self.audit_volume(
+                    novel_name=novel_name,
+                    volume_num=volume_num,
+                    volume_outline=volume_outline,
+                    chapters=batch_chapters,
+                    memory_tables=memory_tables,
+                )
+            except Exception:
+                logger.exception("Batch %d audit failed, skipping", batch_idx + 1)
+                continue
+
+            scores.append(batch_report.overall_score)
+            if batch_report.summary:
+                summaries.append(f"[{batch_label}] {batch_report.summary}")
+
+            # Deduplicate issues by description prefix.
+            for issue in batch_report.logic_issues:
+                key = f"{issue.category}:{issue.description[:50]}"
+                if key not in seen_descriptions:
+                    seen_descriptions.add(key)
+                    all_logic.append(issue)
+
+            for issue in batch_report.ai_flavor_issues:
+                key = f"{issue.category}:{issue.description[:50]}"
+                if key not in seen_descriptions:
+                    seen_descriptions.add(key)
+                    all_ai_flavor.append(issue)
+
+        # Compute weighted average score (larger batches weigh more).
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+
+        merged = AuditReport(
+            volume_num=volume_num,
+            logic_issues=all_logic,
+            ai_flavor_issues=all_ai_flavor,
+            overall_score=round(avg_score, 1),
+            summary="\n".join(summaries),
+        )
+
+        logger.info(
+            "Batch audit complete: score=%.1f logic=%d ai_flavor=%d passed=%s",
+            merged.overall_score,
+            len(merged.logic_issues),
+            len(merged.ai_flavor_issues),
+            merged.passed,
+        )
+
+        return merged
+
     def fix_issues(
         self,
         novel_name: str,
