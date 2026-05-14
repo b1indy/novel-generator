@@ -76,7 +76,7 @@ class ChapterWriter:
     """
 
     # Maximum tokens for chapter generation output.
-    _DEFAULT_MAX_TOKENS: int = 8192
+    _DEFAULT_MAX_TOKENS: int = 16384
     _DEFAULT_TEMPERATURE: float = 0.8
 
     def __init__(
@@ -118,7 +118,7 @@ class ChapterWriter:
         chapter_plan_item: dict[str, Any],
         total_outline: dict[str, Any],
         prev_context: str = "",
-        target_words: int = 3000,
+        target_words: int = 5000,
     ) -> dict[str, str]:
         """Generate a single chapter.
 
@@ -315,7 +315,7 @@ class ChapterWriter:
         blocks.append(
             f"请为小说《{novel_title}》创作第{volume_num}卷「{volume_title}」"
             f"的第{chapter_num}章。\n"
-            f"本章目标字数：约{target_words}字。\n"
+            f"本章目标字数：至少{target_words}字（不少于{int(target_words * 0.8)}字）。\n"
         )
 
         # -- Total outline summary --
@@ -532,7 +532,7 @@ class ChapterWriter:
         volume_outline: dict[str, Any],
         total_outline: dict[str, Any],
         prev_context: str = "",
-        target_words: int = 3000,
+        target_words: int = 5000,
         max_continues: int = 10,
     ) -> list[dict[str, str]]:
         """Generate chapters in a multi-turn conversation for maximum coherence.
@@ -650,7 +650,7 @@ class ChapterWriter:
 
         parts: list[str] = [
             f"你是一位专业的中国网络小说作家。你的任务是连续创作第{first_ch}章到第{last_ch}章"
-            f"（共{len(chapter_plans)}章），每章约{target_words}字。\n\n"
+            f"（共{len(chapter_plans)}章），每章至少{target_words}字（不少于{int(target_words * 0.8)}字）。\n\n"
             f"写作要求：\n"
             f"1. 严格按照提供的写作风格和流派设定进行创作\n"
             f"2. 确保内容与总大纲、卷大纲的剧情方向一致\n"
@@ -701,7 +701,7 @@ class ChapterWriter:
         blocks.append(
             f"请为小说《{novel_title}》连续创作第{volume_num}卷「{volume_title}」"
             f"的第{first_ch}章至第{last_ch}章。\n"
-            f"每章目标字数：约{target_words}字。\n"
+            f"每章目标字数：至少{target_words}字（不少于{int(target_words * 0.8)}字）。\n"
         )
 
         # Total outline summary.
@@ -807,7 +807,7 @@ class ChapterWriter:
         volume_outline: dict[str, Any],
         total_outline: dict[str, Any],
         prev_context: str = "",
-        target_words: int = 3000,
+        target_words: int = 5000,
     ) -> list[dict[str, str]]:
         """Generate multiple chapters in a single LLM call for better coherence.
 
@@ -937,7 +937,7 @@ class ChapterWriter:
         blocks.append(
             f"请为小说《{novel_title}》创作第{volume_num}卷「{volume_title}」"
             f"的第{first_ch}章至第{last_ch}章（共{len(chapter_plans)}章）。\n"
-            f"每章目标字数：约{target_words}字。\n"
+            f"每章目标字数：至少{target_words}字（不少于{int(target_words * 0.8)}字）。\n"
         )
 
         # Total outline summary.

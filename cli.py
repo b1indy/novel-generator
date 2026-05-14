@@ -206,7 +206,7 @@ def load_generation_config(config_path: Path) -> dict[str, int]:
         "words_per_chapter": 5000,
         "batch_size": 3,
         "generation_mode": "continuous",
-        "round_size": 15,
+        "round_size": 10,
     }
     try:
         raw = yaml.safe_load(config_path.read_text())
@@ -857,136 +857,281 @@ def cmd_token(ctx: AppContext) -> None:
 
 
 def _customize_style(ctx: AppContext, style_name: str) -> str:
-    """Interactive style customization flow for the ``new`` command.
+    """LLM-driven style customization via conversation.
 
-    Shows the selected style's parameters, optionally lets the user tweak
-    them, and optionally saves the result as a new named custom style.
+    Instead of manually tweaking parameters, the user describes their novel
+    concept and the LLM generates a comprehensive style document. The LLM
+    asks clarifying questions if needed.
 
     Args:
         ctx: Application context.
-        style_name: Currently selected style name.
+        style_name: Currently selected base style name.
 
     Returns:
         The final style name to use (the original, or a new custom name).
     """
-    # Show current parameters.
-    params = ctx.style_manager.get_style_params(style_name)
+    # Show current style info.
     console.print()
-    console.print(Panel.fit(
-        f"[bold]叙事节奏:[/bold] {params['narrative_rhythm']}\n"
-        f"[bold]对话占比:[/bold] {params['dialogue_ratio']}\n"
-        f"[bold]描写细腻度:[/bold] {params['description_detail']}\n"
-        f"[bold]战斗描写风格:[/bold] {params['battle_style']}\n"
-        f"[bold]情感深度:[/bold] {params['emotional_depth']}\n"
-        f"[bold]句式风格:[/bold] {params['sentence_style']}",
-        title=f"[bold]风格参数: {style_name}[/bold]",
-        border_style="blue",
-    ))
+    try:
+        params = ctx.style_manager.get_style_params(style_name)
+        console.print(Panel.fit(
+            f"[bold]叙事节奏:[/bold] {params['narrative_rhythm']}\n"
+            f"[bold]对话占比:[/bold] {params['dialogue_ratio']}\n"
+            f"[bold]描写细腻度:[/bold] {params['description_detail']}\n"
+            f"[bold]战斗描写风格:[/bold] {params['battle_style']}\n"
+            f"[bold]情感深度:[/bold] {params['emotional_depth']}\n"
+            f"[bold]句式风格:[/bold] {params['sentence_style']}",
+            title=f"[bold]当前基础风格: {style_name}[/bold]",
+            border_style="blue",
+        ))
+    except KeyError:
+        console.print(f"[dim]当前风格: {style_name}[/dim]")
 
-    if not _confirm("是否要自定义此风格？(y/n)", default=False):
+    if not _confirm("是否要通过对话自定义风格？(y/n)", default=False):
         return style_name
 
-    console.print()
-    console.print("[bold cyan]逐项自定义参数（回车保留当前值）[/bold cyan]")
-
-    # 叙事节奏
-    rhythm_map = {"fast": "快速", "moderate": "中等", "slow": "慢速"}
-    current_rhythm = params["narrative_rhythm"]
-    console.print("  可选: fast(快速) / moderate(中等) / slow(慢速)")
-    rhythm_input = _ask(f"  叙事节奏 [当前: {current_rhythm}]", default="")
-    if rhythm_input.strip():
-        new_rhythm = rhythm_map.get(rhythm_input.strip(), current_rhythm)
-    else:
-        new_rhythm = current_rhythm
-
-    # 对话占比
-    dialogue_str = _ask(f"  对话占比（0.0-1.0）[当前: {params['dialogue_ratio']}]", default="")
-    new_dialogue = float(dialogue_str) if dialogue_str.strip() else params["dialogue_ratio"]
-
-    # 描写细腻度
-    detail_str = _ask(f"  描写细腻度（0.0-1.0）[当前: {params['description_detail']}]", default="")
-    new_detail = float(detail_str) if detail_str.strip() else params["description_detail"]
-
-    # 战斗描写风格
-    battle_input = _ask(f"  战斗描写风格 [当前: {params['battle_style']}]", default="")
-    new_battle = battle_input.strip() if battle_input.strip() else params["battle_style"]
-
-    # 情感深度
-    emotion_str = _ask(f"  情感深度（0.0-1.0）[当前: {params['emotional_depth']}]", default="")
-    new_emotion = float(emotion_str) if emotion_str.strip() else params["emotional_depth"]
-
-    # 句式风格
-    sentence_choices = {"concise": "简洁", "balanced": "平衡", "elaborate": "细腻"}
-    current_sentence = params["sentence_style"]
-    console.print("  可选: concise(简洁) / balanced(平衡) / elaborate(细腻)")
-    sentence_input = _ask(f"  句式风格 [当前: {current_sentence}]", default="")
-    if sentence_input.strip():
-        new_sentence = sentence_choices.get(sentence_input.strip(), current_sentence)
-    else:
-        new_sentence = current_sentence
-
-    # Show customized summary.
+    # Collect user's novel concept.
     console.print()
     console.print(Panel.fit(
-        f"[bold]叙事节奏:[/bold] {new_rhythm}\n"
-        f"[bold]对话占比:[/bold] {new_dialogue}\n"
-        f"[bold]描写细腻度:[/bold] {new_detail}\n"
-        f"[bold]战斗描写风格:[/bold] {new_battle}\n"
-        f"[bold]情感深度:[/bold] {new_emotion}\n"
-        f"[bold]句式风格:[/bold] {new_sentence}",
-        title="[bold]自定义后风格[/bold]",
-        border_style="green",
+        "[bold cyan]请描述你的小说构想[/bold cyan]\n\n"
+        "可以包含以下内容（想到什么说什么，不限格式）：\n"
+        "- 故事背景、世界观\n"
+        "- 主角设定、性格特点\n"
+        "- 核心冲突、剧情走向\n"
+        "- 希望的叙事风格、氛围\n"
+        "- 参考作品（如果有的话）\n"
+        "- 其他任何你觉得重要的设定\n\n"
+        "[dim]输入完毕后单独输入一行 'END' 结束[/dim]",
+        border_style="cyan",
     ))
 
-    # Ask to save.
-    if _confirm("是否保存此自定义风格供以后使用？(y/n)", default=True):
-        custom_name = _ask("请输入自定义风格名称")
+    # Collect multi-line input.
+    lines: list[str] = []
+    while True:
         try:
-            style_params = ctx.style_manager.create_custom_style(
-                name=custom_name,
-                narrative_rhythm=new_rhythm,
-                dialogue_ratio=new_dialogue,
-                description_detail=new_detail,
-                battle_style=new_battle,
-                emotional_depth=new_emotion,
-                sentence_style=new_sentence,
-                description=custom_name,
-            )
-            ctx.style_manager.save_custom_style(custom_name, style_params)
-            console.print(f"[green]自定义风格 '{custom_name}' 已保存。[/green]")
-            return custom_name
-        except ValueError as exc:
-            console.print(f"[red]保存失败: {exc}[/red]")
-            console.print("[yellow]仍将使用自定义参数，但仅本次生效。[/yellow]")
+            line = _ask("", default="")
+        except (EOFError, KeyboardInterrupt):
+            break
+        if line.strip().upper() == "END":
+            break
+        lines.append(line)
 
-    # Even if not saved, create an in-memory temporary style for this novel.
-    temp_name = f"_temp_{style_name}_custom"
+    user_concept = "\n".join(lines).strip()
+    if not user_concept:
+        console.print("[yellow]未输入内容，使用原风格。[/yellow]")
+        return style_name
+
+    # LLM conversation loop.
+    console.print()
+    console.print("[cyan]正在分析你的构想...[/cyan]")
+
+    conversation: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": (
+                "你是一位资深的网络小说写作顾问。用户会给你一段小说构想，你需要：\n\n"
+                "1. 分析构想中的关键要素（世界观、角色、冲突、氛围等）\n"
+                "2. 如果信息不够明确，提出2-3个关键问题帮助澄清\n"
+                "3. 如果信息足够，直接生成风格文档\n\n"
+                "风格文档必须包含以下维度（用中文输出JSON格式）：\n"
+                "{\n"
+                '  "style_name": "自定义风格名称（根据构想起一个贴切的名字）",\n'
+                '  "description": "风格简介（100字以内）",\n'
+                '  "narrative_rhythm": "fast/moderate/slow",\n'
+                '  "dialogue_ratio": 0.0-1.0,\n'
+                '  "description_detail": 0.0-1.0,\n'
+                '  "battle_style": "战斗描写风格描述",\n'
+                '  "emotional_depth": 0.0-1.0,\n'
+                '  "sentence_style": "concise/balanced/elaborate",\n'
+                '  "tone": "整体基调（如：热血、阴郁、轻松、沉重等）",\n'
+                '  "pacing": "节奏特点描述",\n'
+                '  "world_building_depth": "世界观构建深度（如：宏大细腻、点到为止等）",\n'
+                '  "character_depth": "角色刻画深度（如：心理描写丰富、以行动展示性格等）",\n'
+                '  "genre_hints": "针对该类型小说的特别写作建议"\n'
+                "}\n\n"
+                "如果需要提问，用JSON格式返回：\n"
+                '{"action": "ask", "questions": ["问题1", "问题2"]}\n\n'
+                "如果信息足够生成风格文档，用JSON格式返回：\n"
+                '{"action": "generate", "style": {上述风格文档}}'
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"我的小说构想：\n\n{user_concept}\n\n基础风格参考：{style_name}",
+        },
+    ]
+
+    ctx.token_tracker.set_category("other")
+
+    while True:
+        try:
+            response = ctx.llm_client.chat(
+                conversation,
+                temperature=0.7,
+                max_tokens=4096,
+            )
+        except LLMError as exc:
+            console.print(f"[red]LLM 调用失败: {exc}[/red]")
+            console.print("[yellow]使用原风格继续。[/yellow]")
+            return style_name
+
+        # Parse response.
+        try:
+            result = _parse_json_response(response)
+        except (ValueError, KeyError):
+            # If JSON parsing fails, treat as a conversational response.
+            console.print()
+            console.print(Panel.fit(response, border_style="cyan"))
+            user_reply = _ask("请回复（或输入 'ok' 接受建议）", default="ok")
+            if user_reply.strip().lower() == "ok":
+                # Try to extract style from the response text.
+                console.print("[yellow]无法解析风格文档，使用原风格。[/yellow]")
+                return style_name
+            conversation.append({"role": "assistant", "content": response})
+            conversation.append({"role": "user", "content": user_reply})
+            continue
+
+        action = result.get("action", "")
+
+        if action == "ask":
+            # LLM wants to ask clarifying questions.
+            questions = result.get("questions", [])
+            console.print()
+            console.print(Panel.fit(
+                "[bold]我需要了解更多：[/bold]",
+                border_style="yellow",
+            ))
+            for i, q in enumerate(questions, 1):
+                console.print(f"  {i}. {q}")
+
+            console.print()
+            answers: list[str] = []
+            for i, q in enumerate(questions, 1):
+                answer = _ask(f"  问题{i}", default="")
+                answers.append(f"问：{q}\n答：{answer}")
+
+            conversation.append({"role": "assistant", "content": response})
+            conversation.append({
+                "role": "user",
+                "content": "\n\n".join(answers),
+            })
+            console.print("[cyan]继续分析...[/cyan]")
+            continue
+
+        if action == "generate":
+            # LLM generated the style document.
+            style_doc = result.get("style", {})
+            custom_name = style_doc.get("style_name", f"{style_name}_custom")
+            description = style_doc.get("description", "")
+
+            # Display the generated style.
+            console.print()
+            console.print(Panel.fit(
+                f"[bold]风格名称:[/bold] {custom_name}\n"
+                f"[bold]简介:[/bold] {description}\n\n"
+                f"[bold]叙事节奏:[/bold] {style_doc.get('narrative_rhythm', 'moderate')}\n"
+                f"[bold]对话占比:[/bold] {style_doc.get('dialogue_ratio', 0.3)}\n"
+                f"[bold]描写细腻度:[/bold] {style_doc.get('description_detail', 0.7)}\n"
+                f"[bold]战斗描写风格:[/bold] {style_doc.get('battle_style', '')}\n"
+                f"[bold]情感深度:[/bold] {style_doc.get('emotional_depth', 0.6)}\n"
+                f"[bold]句式风格:[/bold] {style_doc.get('sentence_style', 'balanced')}\n"
+                f"[bold]整体基调:[/bold] {style_doc.get('tone', '')}\n"
+                f"[bold]节奏特点:[/bold] {style_doc.get('pacing', '')}\n"
+                f"[bold]世界观深度:[/bold] {style_doc.get('world_building_depth', '')}\n"
+                f"[bold]角色刻画:[/bold] {style_doc.get('character_depth', '')}\n"
+                f"[bold]类型建议:[/bold] {style_doc.get('genre_hints', '')}",
+                title="[bold green]生成的风格文档[/bold green]",
+                border_style="green",
+            ))
+
+            # Ask for confirmation.
+            console.print()
+            choice = _ask(
+                "是否接受此风格？",
+                choices=["y", "n", "q"],
+                default="y",
+            )
+
+            if choice == "q":
+                console.print("[yellow]使用原风格。[/yellow]")
+                return style_name
+
+            if choice == "n":
+                feedback = _ask("请描述需要调整的地方", default="")
+                if feedback.strip():
+                    conversation.append({"role": "assistant", "content": response})
+                    conversation.append({
+                        "role": "user",
+                        "content": f"请调整风格：{feedback}",
+                    })
+                    console.print("[cyan]正在调整...[/cyan]")
+                    continue
+                return style_name
+
+            # Accept and save.
+            try:
+                style_params = ctx.style_manager.create_custom_style(
+                    name=custom_name,
+                    narrative_rhythm=style_doc.get("narrative_rhythm", "moderate"),
+                    dialogue_ratio=float(style_doc.get("dialogue_ratio", 0.3)),
+                    description_detail=float(style_doc.get("description_detail", 0.7)),
+                    battle_style=style_doc.get("battle_style", ""),
+                    emotional_depth=float(style_doc.get("emotional_depth", 0.6)),
+                    sentence_style=style_doc.get("sentence_style", "balanced"),
+                    description=description,
+                )
+                # Store extra fields in the style params for later use.
+                style_params["tone"] = style_doc.get("tone", "")
+                style_params["pacing"] = style_doc.get("pacing", "")
+                style_params["world_building_depth"] = style_doc.get("world_building_depth", "")
+                style_params["character_depth"] = style_doc.get("character_depth", "")
+                style_params["genre_hints"] = style_doc.get("genre_hints", "")
+
+                ctx.style_manager.save_custom_style(custom_name, style_params)
+                console.print(f"[green]风格 '{custom_name}' 已保存。[/green]")
+                return custom_name
+            except ValueError as exc:
+                console.print(f"[red]保存失败: {exc}[/red]")
+                console.print("[yellow]使用原风格继续。[/yellow]")
+                return style_name
+
+        # Unknown action.
+        console.print(f"[yellow]未知响应，使用原风格。[/yellow]")
+        return style_name
+
+
+def _parse_json_response(text: str) -> dict[str, Any]:
+    """Extract JSON from LLM response text."""
+    import json
+
+    text = text.strip()
+
+    # Try direct parse.
     try:
-        ctx.style_manager.create_custom_style(
-            name=temp_name,
-            narrative_rhythm=new_rhythm,
-            dialogue_ratio=new_dialogue,
-            description_detail=new_detail,
-            battle_style=new_battle,
-            emotional_depth=new_emotion,
-            sentence_style=new_sentence,
-            description=f"临时自定义({style_name})",
-        )
-        return temp_name
-    except ValueError:
-        # Already exists from a prior temp creation; update in place.
-        ctx.style_manager.delete_custom_style(temp_name)
-        ctx.style_manager.create_custom_style(
-            name=temp_name,
-            narrative_rhythm=new_rhythm,
-            dialogue_ratio=new_dialogue,
-            description_detail=new_detail,
-            battle_style=new_battle,
-            emotional_depth=new_emotion,
-            sentence_style=new_sentence,
-            description=f"临时自定义({style_name})",
-        )
-        return temp_name
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try extracting from code fences.
+    import re
+    fence_pattern = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
+    matches = fence_pattern.findall(text)
+    for match in matches:
+        try:
+            return json.loads(match.strip())
+        except json.JSONDecodeError:
+            continue
+
+    # Try finding outermost { ... }.
+    brace_start = text.find("{")
+    brace_end = text.rfind("}")
+    if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
+        try:
+            return json.loads(text[brace_start : brace_end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError("Could not extract JSON from response")
 
 
 # ===================================================================
@@ -1226,7 +1371,7 @@ def _write_volume(
     ctx: AppContext,
     novel_name: str,
     volume_num: int,
-    words_per_chapter: int = 3000,
+    words_per_chapter: int = 5000,
     auto_audit: bool = False,
 ) -> None:
     """Common volume writing logic shared by ``new``, ``write``, and ``continue``.
