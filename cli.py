@@ -206,7 +206,7 @@ def load_generation_config(config_path: Path) -> dict[str, int]:
         "words_per_chapter": 5000,
         "batch_size": 3,
         "generation_mode": "continuous",
-        "round_size": 15,
+        "round_size": 10,
     }
     try:
         raw = yaml.safe_load(config_path.read_text())
@@ -1371,7 +1371,7 @@ def _write_volume(
     ctx: AppContext,
     novel_name: str,
     volume_num: int,
-    words_per_chapter: int = 3000,
+    words_per_chapter: int = 5000,
     auto_audit: bool = False,
 ) -> None:
     """Common volume writing logic shared by ``new``, ``write``, and ``continue``.

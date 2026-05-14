@@ -97,7 +97,7 @@ class VolumeWriter:
         novel_store: NovelStore,
         table_store: TableStore,
         summary_generator: SummaryGenerator | None = None,
-        round_size: int = 15,
+        round_size: int = 10,
     ) -> None:
         """Initialise the volume writer with all required dependencies.
 
@@ -253,7 +253,7 @@ class VolumeWriter:
         total_outline: dict[str, Any],
         recent_texts: list[str],
         words_per_chapter: int,
-        round_size: int = 15,
+        round_size: int = 10,
     ) -> tuple[list[dict[str, Any]], int]:
         """Generate chapters using multi-turn continuous mode.
 

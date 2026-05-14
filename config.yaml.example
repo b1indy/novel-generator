@@ -15,7 +15,7 @@ generation:
   chapters_per_volume: 50        # 每卷默认章数 (可自行修改)
   generation_mode: "continuous"  # 生成模式: single(逐章), batch(批量), continuous(连续对话)
   batch_size: 3                  # batch模式下每次LLM调用生成章节数
-  round_size: 15                 # continuous模式下每轮章节数
+  round_size: 10                 # continuous模式下每轮章节数
   target_total_words: 2000000    # 目标总字数
 
 # 审计参数
