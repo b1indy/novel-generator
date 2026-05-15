@@ -597,6 +597,21 @@ def cmd_audit(ctx: AppContext, args: argparse.Namespace) -> None:
     import json
     outline_text = json.dumps(volume_outline, ensure_ascii=False, indent=2)
 
+    # Load previous volume's last 2 chapters for cross-volume continuity.
+    prev_volume_chapters = None
+    if volume_num > 1:
+        try:
+            prev_volume_chapters = ctx.novel_store.load_last_n_chapters(
+                novel_name, 2
+            )
+            # Filter to only chapters from volume N-1.
+            prev_volume_chapters = [
+                ch for ch in prev_volume_chapters
+                if ch.get("volume") == volume_num - 1
+            ][:2]
+        except Exception:
+            logger.debug("Could not load previous volume chapters for audit")
+
     # Run audit (batched with overlapping windows for cross-batch continuity).
     ctx.token_tracker.set_category("auditing")
     auditor = ctx.make_auditor()
@@ -610,6 +625,7 @@ def cmd_audit(ctx: AppContext, args: argparse.Namespace) -> None:
                 memory_tables=memory_tables,
                 batch_size=10,
                 overlap=3,
+                prev_volume_chapters=prev_volume_chapters,
             )
         except Exception as exc:
             console.print(f"[red]审计失败: {exc}[/red]")
@@ -617,37 +633,37 @@ def cmd_audit(ctx: AppContext, args: argparse.Namespace) -> None:
 
     _display_audit_report(report)
 
-    # Fix if requested.
-    if args.fix:
-        if not report.all_issues:
-            console.print("[green]没有问题需要修复。[/green]")
+    # Auto-fix if there are issues.
+    if not report.all_issues:
+        console.print("[green]没有问题需要修复。[/green]")
+        return
+
+    if not _confirm(
+        f"发现 {len(report.all_issues)} 个问题，是否自动修复？", default=True
+    ):
+        return
+
+    ctx.token_tracker.set_category("auditing")
+    with console.status("[cyan]正在修复问题...[/cyan]", spinner="dots"):
+        try:
+            fixed_chapters = auditor.fix_issues(
+                novel_name=novel_name,
+                volume_num=volume_num,
+                audit_report=report,
+                chapters=chapters,
+            )
+        except Exception as exc:
+            console.print(f"[red]修复失败: {exc}[/red]")
             return
 
-        if not _confirm(
-            f"发现 {len(report.all_issues)} 个问题，是否自动修复？", default=True
-        ):
-            return
+    # Save fixed chapters.
+    for idx, ch in enumerate(fixed_chapters):
+        ch_num = idx + 1
+        title = ch.get("title", f"第{ch_num}章")
+        content = ch.get("content", "")
+        ctx.novel_store.save_chapter(novel_name, volume_num, ch_num, content, title)
 
-        with console.status("[cyan]正在修复问题...[/cyan]", spinner="dots"):
-            try:
-                fixed_chapters = auditor.fix_issues(
-                    novel_name=novel_name,
-                    volume_num=volume_num,
-                    audit_report=report,
-                    chapters=chapters,
-                )
-            except Exception as exc:
-                console.print(f"[red]修复失败: {exc}[/red]")
-                return
-
-        # Save fixed chapters.
-        for idx, ch in enumerate(fixed_chapters):
-            ch_num = idx + 1
-            title = ch.get("title", f"第{ch_num}章")
-            content = ch.get("content", "")
-            ctx.novel_store.save_chapter(novel_name, volume_num, ch_num, content, title)
-
-        console.print("[green]修复完成，已保存所有章节。[/green]")
+    console.print("[green]修复完成，已保存所有章节。[/green]")
 
 
 # ===================================================================
@@ -1593,16 +1609,15 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         help="审计小说质量（逻辑+AI味）",
         description=(
-            "对指定卷进行双维度质量审计，单次 LLM 调用同时检查:\n"
+            "对指定卷进行分批交叉质量审计，同时检查:\n"
             "  1. 逻辑一致性 — 角色行为、时间线、物品归属、伏笔衔接、世界观\n"
             "  2. AI写作痕迹 — 重复句式、模板化描写、生硬对话、情感平淡\n\n"
-            "审计结果按严重程度（critical/major/minor）分类展示。\n"
-            "使用 --fix 可自动修复发现的问题。"
+            "每批10章，重叠3章，重点检查跨批逻辑脱节。\n"
+            "审计后自动提示修复发现的问题。"
         ),
         epilog=(
             "示例:\n"
-            "  python cli.py audit --novel my-novel --volume 1         仅审计，输出报告\n"
-            "  python cli.py audit --novel my-novel --volume 1 --fix   审计并自动修复\n\n"
+            "  python cli.py audit --novel my-novel --volume 1\n\n"
             "💡 建议每写完一卷就审计一次，及时修复问题比事后补救更省力。"
         ),
     )
@@ -1613,10 +1628,6 @@ def build_parser() -> argparse.ArgumentParser:
     audit_parser.add_argument(
         "--volume", type=int, required=True, metavar="N",
         help="要审计的卷号（必填）",
-    )
-    audit_parser.add_argument(
-        "--fix", action="store_true",
-        help="审计后自动修复发现的问题",
     )
 
     # --- status ---

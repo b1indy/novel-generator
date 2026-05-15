@@ -173,12 +173,14 @@ class Auditor:
         memory_tables: dict[str, Any],
         batch_size: int = 10,
         overlap: int = 3,
+        prev_volume_chapters: list[dict[str, str]] | None = None,
     ) -> AuditReport:
         """Audit a volume in overlapping batches for better cross-batch continuity.
 
         Each batch covers ``batch_size`` chapters, overlapping ``overlap``
-        chapters with the previous batch. This ensures cross-batch logic
-        consistency is checked.
+        chapters with the previous batch. For volumes after the first, the
+        last 2 chapters of the previous volume are prepended to the first
+        batch to check cross-volume continuity.
 
         Args:
             novel_name: Human-readable novel title.
@@ -188,16 +190,30 @@ class Auditor:
             memory_tables: Character/item/foreshadowing tables.
             batch_size: Chapters per batch (default 10).
             overlap: Chapters overlapping between batches (default 3).
+            prev_volume_chapters: Last 2 chapters of previous volume
+                (for cross-volume continuity check). Only used when
+                volume_num > 1.
 
         Returns:
             Merged :class:`AuditReport` with deduplicated issues.
         """
-        total = len(chapters)
+        # For volumes after the first, prepend previous volume's last 2
+        # chapters to the first batch for cross-volume continuity.
+        effective_chapters = list(chapters)
+        cross_volume_prefix: list[dict[str, str]] = []
+        if volume_num > 1 and prev_volume_chapters:
+            cross_volume_prefix = [
+                {"title": f"[前卷] {ch.get('title', '')}", "content": ch.get("content", "")}
+                for ch in prev_volume_chapters[-2:]
+            ]
+            effective_chapters = cross_volume_prefix + effective_chapters
+
+        total = len(effective_chapters)
         if total <= batch_size:
             # Small enough to audit in one call.
             return self.audit_volume(
                 novel_name, volume_num, volume_outline,
-                chapters, memory_tables,
+                effective_chapters, memory_tables,
             )
 
         # Generate overlapping batch ranges.
@@ -224,8 +240,12 @@ class Auditor:
         seen_descriptions: set[str] = set()
 
         for batch_idx, (batch_start, batch_end) in enumerate(batches):
-            batch_chapters = chapters[batch_start:batch_end]
-            batch_label = f"ch_{batch_start + 1:03d}-ch_{batch_end:03d}"
+            batch_chapters = effective_chapters[batch_start:batch_end]
+            # Label uses original chapter numbers (subtract prefix length).
+            prefix_len = len(cross_volume_prefix)
+            orig_start = max(0, batch_start - prefix_len)
+            orig_end = batch_end - prefix_len
+            batch_label = f"ch_{orig_start + 1:03d}-ch_{orig_end:03d}"
 
             logger.info(
                 "  Batch %d/%d: %s (%d chapters)",
