@@ -325,6 +325,10 @@ class LLMClient:
             return "".join(chunks)
 
         def _call() -> str:
+            # Estimate input tokens from messages before API call.
+            input_text = "\n".join(m.get("content", "") for m in messages)
+            est_input_tokens = self.count_tokens(input_text)
+
             response = self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,  # type: ignore[arg-type]
@@ -333,12 +337,39 @@ class LLMClient:
                 stream=False,
             )
             content: Optional[str] = response.choices[0].message.content
+            output_text = content or ""
 
-            # Track token usage from API response.
-            if self._tracker and hasattr(response, "usage") and response.usage:
+            # Track token usage from API response, with fallback estimation.
+            if self._tracker:
+                input_tok = 0
+                output_tok = 0
+
+                # Try to get from API response.
+                if hasattr(response, "usage") and response.usage:
+                    try:
+                        input_tok = getattr(response.usage, "prompt_tokens", 0) or 0
+                        output_tok = getattr(response.usage, "completion_tokens", 0) or 0
+                        # Some APIs return total_tokens but not input/output separately.
+                        if input_tok == 0 and output_tok == 0:
+                            total_tok = getattr(response.usage, "total_tokens", 0) or 0
+                            if total_tok > 0:
+                                input_tok = int(total_tok * 0.7)
+                                output_tok = total_tok - input_tok
+                    except Exception:
+                        logger.debug("Failed to parse usage from API response")
+
+                # Fallback: estimate from text length if API didn't return usage.
+                if input_tok == 0:
+                    input_tok = est_input_tokens
+                if output_tok == 0:
+                    output_tok = self.count_tokens(output_text)
+
                 self._tracker.record_auto(
-                    input_tokens=response.usage.prompt_tokens or 0,
-                    output_tokens=response.usage.completion_tokens or 0,
+                    input_tokens=input_tok,
+                    output_tokens=output_tok,
+                )
+                logger.debug(
+                    "Token tracked: input=%d output=%d", input_tok, output_tok
                 )
 
             return content or ""
