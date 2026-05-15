@@ -870,6 +870,92 @@ def cmd_token(ctx: AppContext) -> None:
 
 
 # ===================================================================
+# Command: export
+# ===================================================================
+
+
+def cmd_export(ctx: AppContext, args: argparse.Namespace) -> None:
+    """Export a novel to a TXT file."""
+    novel_name = _require_novel(ctx, args.novel)
+    if novel_name is None:
+        return
+
+    # Load meta for title.
+    tbl = ctx.make_table_store(novel_name)
+    meta = tbl.load_meta()
+    novel_title = meta.get("title", novel_name)
+
+    # Determine which volumes to export.
+    volume_num = getattr(args, "volume", None)
+    if volume_num is not None:
+        volumes_to_export = [volume_num]
+    else:
+        volume_count = ctx.novel_store.get_volume_count(novel_name)
+        if volume_count == 0:
+            console.print(f"[red]小说'{novel_name}'没有已生成的卷。[/red]")
+            return
+        volumes_to_export = list(range(1, volume_count + 1))
+
+    # Determine output filename.
+    output_file = getattr(args, "output", None)
+    if not output_file:
+        output_file = f"{novel_name}.txt"
+
+    console.print(f"[cyan]正在导出 {novel_title}...[/cyan]")
+
+    # Collect all chapters.
+    all_chapters: list[dict[str, str]] = []
+    for vol_num in volumes_to_export:
+        chapters = ctx.novel_store.load_volume(novel_name, vol_num)
+        if not chapters:
+            console.print(f"[yellow]第{vol_num}卷没有章节，跳过。[/yellow]")
+            continue
+        all_chapters.extend(chapters)
+        console.print(f"  第{vol_num}卷: {len(chapters)}章")
+
+    if not all_chapters:
+        console.print("[red]没有可导出的章节。[/red]")
+        return
+
+    # Write to file.
+    try:
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(f"{novel_title}\n\n")
+            for ch in all_chapters:
+                title = ch.get("title", "")
+                content = ch.get("content", "")
+                # Write title (strip markdown ## if present)
+                if title.startswith("## "):
+                    title = title[3:]
+                f.write(f"{title}\n\n")
+                # Write content (strip the title line if it's duplicated)
+                lines = content.split("\n")
+                body_lines = []
+                skip_first_title = True
+                for line in lines:
+                    if skip_first_title and line.startswith("## "):
+                        skip_first_title = False
+                        continue
+                    body_lines.append(line)
+                f.write("\n".join(body_lines).strip())
+                f.write("\n\n" + "=" * 50 + "\n\n")
+    except Exception as exc:
+        console.print(f"[red]导出失败: {exc}[/red]")
+        return
+
+    total_chars = sum(len(ch.get("content", "")) for ch in all_chapters)
+    console.print()
+    console.print(Panel.fit(
+        f"[bold]文件:[/bold] {output_file}\n"
+        f"[bold]卷数:[/bold] {len(volumes_to_export)}\n"
+        f"[bold]章数:[/bold] {len(all_chapters)}\n"
+        f"[bold]字数:[/bold] ~{total_chars:,}",
+        title="[bold green]导出完成[/bold green]",
+        border_style="green",
+    ))
+
+
+# ===================================================================
 # Style customization helper
 # ===================================================================
 
@@ -1702,6 +1788,35 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="示例:\n  python cli.py token",
     )
 
+    # --- export ---
+    export_parser = sub.add_parser(
+        "export",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="导出小说为TXT文件",
+        description=(
+            "将已生成的小说导出为TXT文件。\n"
+            "默认导出全部卷，也可指定卷号。"
+        ),
+        epilog=(
+            "示例:\n"
+            "  python cli.py export --novel my-novel              导出全部卷\n"
+            "  python cli.py export --novel my-novel --volume 1   仅导出第1卷\n"
+            "  python cli.py export --novel my-novel -o book.txt  指定输出文件名"
+        ),
+    )
+    export_parser.add_argument(
+        "--novel", type=str, required=True,
+        help="小说名称（必填）",
+    )
+    export_parser.add_argument(
+        "--volume", type=int, metavar="N",
+        help="仅导出指定卷（不指定则导出全部）",
+    )
+    export_parser.add_argument(
+        "-o", "--output", type=str,
+        help="输出文件名（默认: <小说名称>.txt）",
+    )
+
     return parser
 
 
@@ -1763,6 +1878,7 @@ def main() -> None:
         "status": lambda: cmd_status(ctx, args),
         "continue": lambda: cmd_continue(ctx, args),
         "token": lambda: cmd_token(ctx),
+        "export": lambda: cmd_export(ctx, args),
     }
 
     handler = dispatch.get(args.command)
