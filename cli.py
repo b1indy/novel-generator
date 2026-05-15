@@ -633,157 +633,17 @@ def cmd_audit(ctx: AppContext, args: argparse.Namespace) -> None:
 
     _display_audit_report(report)
 
-    # Save audit report for later fix.
-    report_path = Path("data/novels") / novel_name / f"audit_vol{volume_num:03d}.json"
-    try:
-        report_data = {
-            "volume_num": report.volume_num,
-            "overall_score": report.overall_score,
-            "summary": report.summary,
-            "logic_issues": [
-                {
-                    "severity": i.severity,
-                    "category": i.category,
-                    "location": i.location,
-                    "description": i.description,
-                    "suggestion": i.suggestion,
-                }
-                for i in report.logic_issues
-            ],
-            "ai_flavor_issues": [
-                {
-                    "severity": i.severity,
-                    "category": i.category,
-                    "location": i.location,
-                    "description": i.description,
-                    "suggestion": i.suggestion,
-                }
-                for i in report.ai_flavor_issues
-            ],
-        }
-        report_path.write_text(
-            json.dumps(report_data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        console.print(f"[dim]审计报告已保存: {report_path}[/dim]")
-    except Exception:
-        logger.debug("Failed to save audit report")
-
-    # Fix if requested.
-    if args.fix:
-        if not report.all_issues:
-            console.print("[green]没有问题需要修复。[/green]")
-            return
-
-        if not _confirm(
-            f"发现 {len(report.all_issues)} 个问题，是否自动修复？", default=True
-        ):
-            return
-
-        with console.status("[cyan]正在修复问题...[/cyan]", spinner="dots"):
-            try:
-                fixed_chapters = auditor.fix_issues(
-                    novel_name=novel_name,
-                    volume_num=volume_num,
-                    audit_report=report,
-                    chapters=chapters,
-                )
-            except Exception as exc:
-                console.print(f"[red]修复失败: {exc}[/red]")
-                return
-
-        # Save fixed chapters.
-        for idx, ch in enumerate(fixed_chapters):
-            ch_num = idx + 1
-            title = ch.get("title", f"第{ch_num}章")
-            content = ch.get("content", "")
-            ctx.novel_store.save_chapter(novel_name, volume_num, ch_num, content, title)
-
-        console.print("[green]修复完成，已保存所有章节。[/green]")
-
-
-# ===================================================================
-# Command: fix
-# ===================================================================
-
-
-def cmd_fix(ctx: AppContext, args: argparse.Namespace) -> None:
-    """Fix issues from a saved audit report without re-auditing."""
-    novel_name = _require_novel(ctx, args.novel)
-    if novel_name is None:
-        return
-    volume_num: int = args.volume
-
-    # Load saved audit report.
-    report_path = Path("data/novels") / novel_name / f"audit_vol{volume_num:03d}.json"
-    if not report_path.exists():
-        console.print(
-            f"[red]未找到第{volume_num}卷的审计报告。[/red]\n"
-            f"[dim]请先运行: python cli.py audit --novel {novel_name} --volume {volume_num}[/dim]"
-        )
-        return
-
-    try:
-        report_data = json.loads(report_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        console.print(f"[red]读取审计报告失败: {exc}[/red]")
-        return
-
-    # Reconstruct AuditReport.
-    from src.auditor.auditor import AuditReport, AuditIssue
-
-    logic_issues = [
-        AuditIssue(
-            severity=i.get("severity", "minor"),
-            category=i.get("category", "logic"),
-            location=i.get("location", ""),
-            description=i.get("description", ""),
-            suggestion=i.get("suggestion", ""),
-        )
-        for i in report_data.get("logic_issues", [])
-    ]
-    ai_flavor_issues = [
-        AuditIssue(
-            severity=i.get("severity", "minor"),
-            category=i.get("category", "ai_flavor"),
-            location=i.get("location", ""),
-            description=i.get("description", ""),
-            suggestion=i.get("suggestion", ""),
-        )
-        for i in report_data.get("ai_flavor_issues", [])
-    ]
-
-    report = AuditReport(
-        volume_num=volume_num,
-        logic_issues=logic_issues,
-        ai_flavor_issues=ai_flavor_issues,
-        overall_score=report_data.get("overall_score", 0),
-        summary=report_data.get("summary", ""),
-    )
-
+    # Auto-fix if there are issues.
     if not report.all_issues:
-        console.print("[green]审计报告中没有问题需要修复。[/green]")
+        console.print("[green]没有问题需要修复。[/green]")
         return
 
-    _display_audit_report(report)
-
-    # Load chapters.
-    try:
-        chapters = ctx.novel_store.load_volume(novel_name, volume_num)
-    except Exception:
-        console.print(f"[red]无法加载第{volume_num}卷章节。[/red]")
-        return
-
-    # Fix.
-    ctx.token_tracker.set_category("auditing")
-    auditor = ctx.make_auditor()
-
-    console.print()
     if not _confirm(
         f"发现 {len(report.all_issues)} 个问题，是否自动修复？", default=True
     ):
         return
 
+    ctx.token_tracker.set_category("auditing")
     with console.status("[cyan]正在修复问题...[/cyan]", spinner="dots"):
         try:
             fixed_chapters = auditor.fix_issues(
@@ -1749,16 +1609,15 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         help="审计小说质量（逻辑+AI味）",
         description=(
-            "对指定卷进行双维度质量审计，单次 LLM 调用同时检查:\n"
+            "对指定卷进行分批交叉质量审计，同时检查:\n"
             "  1. 逻辑一致性 — 角色行为、时间线、物品归属、伏笔衔接、世界观\n"
             "  2. AI写作痕迹 — 重复句式、模板化描写、生硬对话、情感平淡\n\n"
-            "审计结果按严重程度（critical/major/minor）分类展示。\n"
-            "使用 --fix 可自动修复发现的问题。"
+            "每批10章，重叠3章，重点检查跨批逻辑脱节。\n"
+            "审计后自动提示修复发现的问题。"
         ),
         epilog=(
             "示例:\n"
-            "  python cli.py audit --novel my-novel --volume 1         仅审计，输出报告\n"
-            "  python cli.py audit --novel my-novel --volume 1 --fix   审计并自动修复\n\n"
+            "  python cli.py audit --novel my-novel --volume 1\n\n"
             "💡 建议每写完一卷就审计一次，及时修复问题比事后补救更省力。"
         ),
     )
@@ -1769,34 +1628,6 @@ def build_parser() -> argparse.ArgumentParser:
     audit_parser.add_argument(
         "--volume", type=int, required=True, metavar="N",
         help="要审计的卷号（必填）",
-    )
-    audit_parser.add_argument(
-        "--fix", action="store_true",
-        help="审计后自动修复发现的问题",
-    )
-
-    # --- fix ---
-    fix_parser = sub.add_parser(
-        "fix",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help="根据已有审计报告修复问题（不重新审计）",
-        description=(
-            "加载之前审计保存的报告，直接修复发现的问题，无需重新审计。\n"
-            "审计报告在运行 audit 命令时自动保存到 data/novels/<名称>/ 目录下。"
-        ),
-        epilog=(
-            "示例:\n"
-            "  python cli.py audit --novel X --volume 1        先审计\n"
-            "  python cli.py fix --novel X --volume 1          再修复（不重新审计）"
-        ),
-    )
-    fix_parser.add_argument(
-        "--novel", type=str, required=True,
-        help="小说名称（必填）",
-    )
-    fix_parser.add_argument(
-        "--volume", type=int, required=True, metavar="N",
-        help="要修复的卷号（必填）",
     )
 
     # --- status ---
@@ -1929,7 +1760,6 @@ def main() -> None:
         "outline": lambda: cmd_outline(ctx, args),
         "write": lambda: cmd_write(ctx, args),
         "audit": lambda: cmd_audit(ctx, args),
-        "fix": lambda: cmd_fix(ctx, args),
         "status": lambda: cmd_status(ctx, args),
         "continue": lambda: cmd_continue(ctx, args),
         "token": lambda: cmd_token(ctx),
