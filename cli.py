@@ -638,11 +638,7 @@ def cmd_audit(ctx: AppContext, args: argparse.Namespace) -> None:
         console.print("[green]没有问题需要修复。[/green]")
         return
 
-    if not _confirm(
-        f"发现 {len(report.all_issues)} 个问题，是否自动修复？", default=True
-    ):
-        return
-
+    console.print(f"[cyan]发现 {len(report.all_issues)} 个问题，正在自动修复...[/cyan]")
     ctx.token_tracker.set_category("auditing")
     with console.status("[cyan]正在修复问题...[/cyan]", spinner="dots"):
         try:

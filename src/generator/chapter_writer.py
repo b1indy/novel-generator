@@ -176,18 +176,56 @@ class ChapterWriter:
         # Estimate total prompt tokens for diagnostics.
         prompt_text = system_msg + "\n" + user_msg
         est_tokens = self._llm.count_tokens(prompt_text)
+        min_words = int(target_words * 0.8)
         logger.info(
             "Generating vol_%03d/ch_%03d: prompt ~%d tokens, target ~%d chars",
             volume_num, chapter_num, est_tokens, target_words,
         )
 
-        response = self._llm.chat(
-            messages,
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
-        )
+        # Generate with retry if word count is too low.
+        max_retries = 3
+        for attempt in range(max_retries + 1):
+            response = self._llm.chat(
+                messages,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+            )
 
-        return self._parse_chapter_response(response, volume_num, chapter_num)
+            result = self._parse_chapter_response(response, volume_num, chapter_num)
+            content = result.get("content", "")
+
+            # Count Chinese characters in the content body (excluding title line).
+            body_lines = content.split("\n")
+            body = "\n".join(
+                line for line in body_lines if not line.startswith("## ")
+            )
+            chinese_chars = len(re.findall(r"[一-鿿]", body))
+
+            if chinese_chars >= min_words:
+                return result
+
+            if attempt < max_retries:
+                logger.warning(
+                    "vol_%03d/ch_%03d: %d Chinese chars < %d minimum, retry %d/%d",
+                    volume_num, chapter_num, chinese_chars, min_words,
+                    attempt + 1, max_retries,
+                )
+                # Add a reminder to the messages for the retry.
+                messages.append({"role": "assistant", "content": response})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"章节字数不足（仅{chinese_chars}字，要求至少{min_words}字）。"
+                        f"请重新生成完整的章节内容，确保不少于{target_words}字。"
+                    ),
+                })
+            else:
+                logger.warning(
+                    "vol_%03d/ch_%03d: still %d chars after %d retries, accepting",
+                    volume_num, chapter_num, chinese_chars, max_retries,
+                )
+
+        return result
 
     # ------------------------------------------------------------------
     # Memory update
